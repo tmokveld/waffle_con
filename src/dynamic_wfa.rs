@@ -166,24 +166,15 @@ impl DWFALite {
         // first, increase the distance we're at
         self.edit_distance += 1;
 
-        // create an empty new wavefront
-        let new_wf_len = self.wavefront.len() + 2;
-        let mut new_wavefront: Vec<usize> = vec![0; new_wf_len];
-
-        // now we need to populate the wavefront
-        for (i, &d) in self.wavefront.iter().enumerate() {
-            // deletion (skipping) of a base in `baseline_seq`; this does not change the distance into `other_seq`
-            new_wavefront[i] = new_wavefront[i].max(d);
-
-            // mismatch progresses both sequences
-            new_wavefront[i+1] = new_wavefront[i+1].max(d + 1);
-
-            // insertion of a base into `baseline_seq`; this progresses `other_seq`
-            new_wavefront[i+2] = new_wavefront[i+2].max(d + 1);
+        let old_len = self.wavefront.len();
+        self.wavefront.resize(old_len + 2, 0);
+        // Old slots supply deletion transitions. Reverse traversal reads each
+        // old value before mismatch/insertion transitions can overwrite it.
+        for i in (0..old_len).rev() {
+            let advanced = self.wavefront[i] + 1;
+            self.wavefront[i + 1] = self.wavefront[i + 1].max(advanced);
+            self.wavefront[i + 2] = self.wavefront[i + 2].max(advanced);
         }
-
-        // finally, save the new wavefront
-        self.wavefront = new_wavefront;
 
         // re-extend
         self.extend(baseline_seq, other_seq)?;
@@ -295,6 +286,26 @@ mod tests {
             dwfa.update(sequence, &alt_sequence[..(l+1)]).unwrap();
         }
         assert_eq!(dwfa.edit_distance(), 1);
+    }
+
+    #[test]
+    fn test_candidate_counts_across_edit_layers() {
+        let baseline = [0, 255, 0];
+        let other = [255, 0, 0];
+        let expected: [(usize, &[(u8, usize)]); 3] = [
+            (1, &[(0, 2), (255, 1)]),
+            (1, &[(255, 1)]),
+            (2, &[(0, 1), (255, 1)])
+        ];
+        let mut dwfa = DWFALite::default();
+        for (index, (score, counts)) in expected.iter().enumerate() {
+            let prefix = &other[..=index];
+            assert_eq!(dwfa.update(&baseline, prefix).unwrap(), *score);
+            let expected_counts: HashMap<u8, usize> = counts.iter().copied().collect();
+            assert_eq!(dwfa.get_extension_candidates(&baseline, prefix), expected_counts);
+        }
+        dwfa.finalize(&baseline, &other).unwrap();
+        assert_eq!(dwfa.edit_distance(), 2);
     }
 
     #[test]

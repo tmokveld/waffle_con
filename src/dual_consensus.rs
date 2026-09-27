@@ -37,9 +37,10 @@ assert_eq!(consensuses[0].is_consensus1(), &[true, true, true, true, false, fals
 
 use log::{debug, trace, warn};
 use priority_queue::PriorityQueue;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 use simple_error::{bail, SimpleError};
 use std::cmp::Reverse;
+use std::hash::BuildHasherDefault;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
@@ -314,7 +315,7 @@ impl<'a> DualConsensusDWFA<'a> {
         let initial_priority = initial_node.priority(self.consensus_cost());
 
         // start the priority queue, which defaults to bigger is better so we need a Reverse since want smaller costs
-        let mut pqueue: PriorityQueue<DualConsensusNode, NodePriority> = PriorityQueue::new();
+        let mut pqueue: PriorityQueue<DualConsensusNode, NodePriority, BuildHasherDefault<FxHasher>> = Default::default();
         single_tracker.insert(initial_node.max_consensus_length());
         pqueue.push(initial_node, initial_priority);
 
@@ -645,7 +646,7 @@ impl<'a> DualConsensusDWFA<'a> {
                         let new_priority = new_node.priority(self.consensus_cost());
                         assert!(new_node.is_dual);
                         dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
-                        assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                        assert!(pqueue.push(new_node, new_priority).is_none());
                     }
                 }
             } else {
@@ -675,7 +676,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     let new_priority = new_node.priority(self.consensus_cost());
                     assert!(!new_node.is_dual);
                     single_tracker.insert(new_node.max_consensus_length());
-                    assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                    assert!(pqueue.push(new_node, new_priority).is_none());
                 }
 
                 // now handle dual-node generation
@@ -728,7 +729,7 @@ impl<'a> DualConsensusDWFA<'a> {
                             let new_priority = new_node.priority(self.consensus_cost());
                             assert!(new_node.is_dual);
                             dual_tracker.insert(new_node.max_consensus_length());
-                            assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                            assert!(pqueue.push(new_node, new_priority).is_none());
                         }
                     }
                 }
@@ -1132,8 +1133,23 @@ impl DualConsensusNode {
 
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
-        let (_best_indices, best_costs) = self.costs(consensus_cost);
-        best_costs.iter().sum()
+        self.dwfas1.iter().zip(self.dwfas2.iter())
+            .map(|(dwfa1, dwfa2)| {
+                let mut best_score = usize::MAX;
+                for opt_d in [dwfa1, dwfa2] {
+                    if let Some(d) = opt_d {
+                        let score = match consensus_cost {
+                            ConsensusCost::L1Distance => d.edit_distance(),
+                            ConsensusCost::L2Distance => d.edit_distance().pow(2)
+                        };
+                        if score < best_score {
+                            best_score = score;
+                        }
+                    }
+                }
+                if best_score == usize::MAX { 0 } else { best_score }
+            })
+            .sum()
     }
 
     /// Returns the full set of tracked costs for the two consensuses.

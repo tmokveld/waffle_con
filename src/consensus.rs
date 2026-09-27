@@ -28,9 +28,10 @@ assert_eq!(consensuses[0].scores(), &[1, 0, 1]);
 
 use log::{debug, trace};
 use priority_queue::PriorityQueue;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 use simple_error::bail;
 use std::cmp::Reverse;
+use std::hash::BuildHasherDefault;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::dynamic_wfa::DWFALite;
@@ -214,7 +215,7 @@ impl<'a> ConsensusDWFA<'a> {
         let initial_priority = initial_node.priority(self.consensus_cost());
         
         // start the priority queue, which defaults to bigger is better so we need a Reverse since want smaller costs
-        let mut pqueue: PriorityQueue<ConsensusNode, NodePriority> = PriorityQueue::new();
+        let mut pqueue: PriorityQueue<ConsensusNode, NodePriority, BuildHasherDefault<FxHasher>> = Default::default();
         pqueue_tracker.insert(initial_node.consensus().len());
         pqueue.push(initial_node, initial_priority);
 
@@ -495,7 +496,15 @@ impl ConsensusNode {
 
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
-        self.costs(consensus_cost).iter().sum()
+        self.dwfas.iter()
+            .map(|opt_d| match opt_d {
+                Some(d) => match consensus_cost {
+                    ConsensusCost::L1Distance => d.edit_distance(),
+                    ConsensusCost::L2Distance => d.edit_distance().pow(2)
+                },
+                None => 0
+            })
+            .sum()
     }
 
     /// Returns the node priority.
