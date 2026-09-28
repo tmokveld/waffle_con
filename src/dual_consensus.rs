@@ -40,10 +40,11 @@ use priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 use simple_error::{bail, SimpleError};
 use std::cmp::Reverse;
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
+use crate::consensus_prefix::ConsensusPrefix;
 use crate::dynamic_wfa::DWFALite;
 use crate::pqueue_tracker::PQueueTracker;
 
@@ -122,8 +123,8 @@ impl DualConsensus {
         }
 
         // now we can store the consensus sequences as well as the corresponding indices in the final output
-        let c1 = Consensus::new(finalized_node.consensus1.clone(), consensus_cost, consensus_scores[0].clone());
-        let c2 = Consensus::new(finalized_node.consensus2.clone(), consensus_cost, consensus_scores[1].clone());
+        let c1 = Consensus::new(finalized_node.consensus1.to_vec(), consensus_cost, consensus_scores[0].clone());
+        let c2 = Consensus::new(finalized_node.consensus2.to_vec(), consensus_cost, consensus_scores[1].clone());
 
         // reformat the actual consensus assignments based on swappage, and build result
         let (consensus1, consensus2) = if swap_order {
@@ -802,7 +803,7 @@ impl<'a> DualConsensusDWFA<'a> {
 }
 
 /// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DualConsensusNode {
     /// if True, then this node is tracking two consensuses
     is_dual: bool,
@@ -811,13 +812,24 @@ struct DualConsensusNode {
     /// if True, we are not allowed to modify consensus2 anymore
     is_con2_locked: bool,
     /// The primary consensus sequence
-    consensus1: Vec<u8>,
+    consensus1: ConsensusPrefix,
     /// The secondary consensus sequence
-    consensus2: Vec<u8>,
+    consensus2: ConsensusPrefix,
     /// The set of DWFAs for consensus1; these are options because we stop tracking once the scores diverge
     dwfas1: Vec<Option<DWFALite>>,
     /// The set of DWFAs for consensus2; these are options because we stop tracking once the scores diverge
     dwfas2: Vec<Option<DWFALite>>,
+}
+
+impl Hash for DualConsensusNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Keep full-state equality while avoiding wavefront traversal on hashing.
+        self.is_dual.hash(state);
+        self.is_con1_locked.hash(state);
+        self.is_con2_locked.hash(state);
+        self.consensus1.hash(state);
+        self.consensus2.hash(state);
+    }
 }
 
 impl DualConsensusNode {
@@ -849,8 +861,8 @@ impl DualConsensusNode {
             is_dual: false,
             is_con1_locked: false,
             is_con2_locked: false,
-            consensus1: vec![],
-            consensus2: vec![],
+            consensus1: ConsensusPrefix::default(),
+            consensus2: ConsensusPrefix::default(),
             dwfas1: dwfas,
             dwfas2: vec![None; offsets.len()]
         })

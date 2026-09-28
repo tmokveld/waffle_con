@@ -31,9 +31,10 @@ use priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 use simple_error::bail;
 use std::cmp::Reverse;
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
+use crate::consensus_prefix::ConsensusPrefix;
 use crate::dynamic_wfa::DWFALite;
 use crate::pqueue_tracker::PQueueTracker;
 
@@ -366,12 +367,19 @@ impl<'a> ConsensusDWFA<'a> {
 }
 
 /// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ConsensusNode {
     /// The consensus sequence so far
-    consensus: Vec<u8>,
+    consensus: ConsensusPrefix,
     /// The DWFAs that are tracked for each sequence; these are only None if they have not been activated yet due to an offset
     dwfas: Vec<Option<DWFALite>>
+}
+
+impl Hash for ConsensusNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hashing omits alignment state; derived equality still compares it.
+        self.consensus.hash(state);
+    }
 }
 
 impl ConsensusNode {
@@ -398,7 +406,7 @@ impl ConsensusNode {
         }
 
         Ok(ConsensusNode {
-            consensus: vec![],
+            consensus: ConsensusPrefix::default(),
             dwfas
         })
     }
@@ -583,6 +591,35 @@ mod tests {
     use super::*;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
+
+    #[test]
+    fn test_queue_hash_collision_keeps_distinct_states() {
+        let cost = ConsensusCost::L1Distance;
+        let mut first = ConsensusNode::new_root_node(&[None], None, false).unwrap();
+        let mut second = ConsensusNode::new_root_node(&[None], None, false).unwrap();
+        first.push(&[b"AA"], b'A').unwrap();
+        second.push(&[b"CA"], b'A').unwrap();
+        assert_ne!(first, second);
+        let mut first_hash = FxHasher::default();
+        let mut second_hash = FxHasher::default();
+        first.hash(&mut first_hash);
+        second.hash(&mut second_hash);
+        assert_eq!(first_hash.finish(), second_hash.finish());
+
+        let mut queue = PriorityQueue::<ConsensusNode, NodePriority, BuildHasherDefault<FxHasher>>::default();
+        assert_eq!(queue.push(first.clone(), first.priority(cost)), None);
+        assert_eq!(queue.push(second.clone(), second.priority(cost)), None);
+        assert_eq!(queue.push(first.clone(), first.priority(cost)), Some(first.priority(cost)));
+        assert_eq!(queue.len(), 2);
+        assert!(first.priority(cost) > second.priority(cost));
+        let (popped_first, _) = queue.pop().unwrap();
+        let (popped_second, _) = queue.pop().unwrap();
+        assert_eq!(popped_first.costs(cost), first.costs(cost));
+        assert_eq!(popped_second.costs(cost), second.costs(cost));
+        assert_eq!(popped_first, first);
+        assert_eq!(popped_second, second);
+        assert!(queue.is_empty());
+    }
 
     #[test]
     fn test_single_sequence() {
