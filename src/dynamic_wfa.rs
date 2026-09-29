@@ -78,16 +78,10 @@ impl DWFALite {
         }
 
         // maximally extend everything along the current diagonals
-        self.extend(baseline_seq, other_seq)?;
-        
-        // check how it looks
-        let mut maximum_distance = self.maximum_other_distance();
+        let mut maximum_distance = self.extend(baseline_seq, other_seq);
         while maximum_distance < other_seq.len() && !(self.allow_early_termination && self.reached_baseline_end(baseline_seq)){
             // increase the edit distance, re-extension happens automatically
-            self.increase_edit_distance(baseline_seq, other_seq)?;
-
-            // recalculate this
-            maximum_distance = self.maximum_other_distance();
+            maximum_distance = self.increase_edit_distance(baseline_seq, other_seq)?;
         }
 
         // final assertion just to make sure we don't break anything
@@ -104,12 +98,12 @@ impl DWFALite {
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
-    /// # Errors
-    /// * None so far
-    fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    /// Returns the maximum reach into `other_seq` after extending every diagonal.
+    fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> usize {
         // this is easier logic than trying to handle the option syntax below
         let is_wildcard_disabled = self.wildcard.is_none();
         let wildcard = self.wildcard.unwrap_or_default();
+        let mut maximum_distance = 0;
 
         for (i, d) in self.wavefront.iter_mut().enumerate() {
             // `i` is the index in the wavefront
@@ -148,8 +142,9 @@ impl DWFALite {
                 // we are not done, so add one to this wavefront
                 *d += 1;
             }
+            maximum_distance = maximum_distance.max(*d);
         }
-        Ok(())
+        self.offset + maximum_distance
     }
 
     /// This will increase the edit distance for this DWFA and create a new larger wavefront.
@@ -159,35 +154,25 @@ impl DWFALite {
     /// * `other_seq` - the other sequence, typically getting updates
     /// # Errors
     /// * If the DWFA is already finalized
-    fn increase_edit_distance(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    fn increase_edit_distance(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
         if self.is_finalized {
             bail!("Cannot increase edit distance after finalizing a DWFA");
         }
         // first, increase the distance we're at
         self.edit_distance += 1;
 
-        // create an empty new wavefront
-        let new_wf_len = self.wavefront.len() + 2;
-        let mut new_wavefront: Vec<usize> = vec![0; new_wf_len];
-
-        // now we need to populate the wavefront
-        for (i, &d) in self.wavefront.iter().enumerate() {
-            // deletion (skipping) of a base in `baseline_seq`; this does not change the distance into `other_seq`
-            new_wavefront[i] = new_wavefront[i].max(d);
-
-            // mismatch progresses both sequences
-            new_wavefront[i+1] = new_wavefront[i+1].max(d + 1);
-
-            // insertion of a base into `baseline_seq`; this progresses `other_seq`
-            new_wavefront[i+2] = new_wavefront[i+2].max(d + 1);
+        let old_len = self.wavefront.len();
+        self.wavefront.resize(old_len + 2, 0);
+        // Old slots supply deletion transitions. Reverse traversal reads each
+        // old value before mismatch/insertion transitions can overwrite it.
+        for i in (0..old_len).rev() {
+            let advanced = self.wavefront[i] + 1;
+            self.wavefront[i + 1] = self.wavefront[i + 1].max(advanced);
+            self.wavefront[i + 2] = self.wavefront[i + 2].max(advanced);
         }
 
-        // finally, save the new wavefront
-        self.wavefront = new_wavefront;
-
         // re-extend
-        self.extend(baseline_seq, other_seq)?;
-        Ok(())
+        Ok(self.extend(baseline_seq, other_seq))
     }
 
     /// This function signals that base insertion into `other_seq` is completed.
@@ -269,6 +254,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_incremental_reach_with_offset_and_early_termination() {
+        let baseline = b"AC";
+        let other = b"GGACTT";
+        let mut dwfa = DWFALite::new(None, true);
+        dwfa.set_offset(2);
+        for length in 2..=other.len() {
+            assert_eq!(dwfa.update(baseline, &other[..length]).unwrap(), 0);
+            assert_eq!(dwfa.maximum_other_distance(), length.min(4));
+            assert_eq!(dwfa.maximum_baseline_distance(), (length - 2).min(2));
+        }
+        dwfa.finalize(baseline, other).unwrap();
+        assert_eq!(dwfa.edit_distance(), 0);
+    }
+
+    #[test]
     fn test_new() {
         let dwfa = DWFALite::default();
         assert_eq!(dwfa.edit_distance(), 0);
@@ -295,6 +295,26 @@ mod tests {
             dwfa.update(sequence, &alt_sequence[..(l+1)]).unwrap();
         }
         assert_eq!(dwfa.edit_distance(), 1);
+    }
+
+    #[test]
+    fn test_candidate_counts_across_edit_layers() {
+        let baseline = [0, 255, 0];
+        let other = [255, 0, 0];
+        let expected: [(usize, &[(u8, usize)]); 3] = [
+            (1, &[(0, 2), (255, 1)]),
+            (1, &[(255, 1)]),
+            (2, &[(0, 1), (255, 1)])
+        ];
+        let mut dwfa = DWFALite::default();
+        for (index, (score, counts)) in expected.iter().enumerate() {
+            let prefix = &other[..=index];
+            assert_eq!(dwfa.update(&baseline, prefix).unwrap(), *score);
+            let expected_counts: HashMap<u8, usize> = counts.iter().copied().collect();
+            assert_eq!(dwfa.get_extension_candidates(&baseline, prefix), expected_counts);
+        }
+        dwfa.finalize(&baseline, &other).unwrap();
+        assert_eq!(dwfa.edit_distance(), 2);
     }
 
     #[test]

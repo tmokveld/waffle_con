@@ -37,12 +37,14 @@ assert_eq!(consensuses[0].is_consensus1(), &[true, true, true, true, false, fals
 
 use log::{debug, trace, warn};
 use priority_queue::PriorityQueue;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 use simple_error::{bail, SimpleError};
 use std::cmp::Reverse;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
+use crate::consensus_prefix::ConsensusPrefix;
 use crate::dynamic_wfa::DWFALite;
 use crate::pqueue_tracker::PQueueTracker;
 
@@ -121,8 +123,8 @@ impl DualConsensus {
         }
 
         // now we can store the consensus sequences as well as the corresponding indices in the final output
-        let c1 = Consensus::new(finalized_node.consensus1.clone(), consensus_cost, consensus_scores[0].clone());
-        let c2 = Consensus::new(finalized_node.consensus2.clone(), consensus_cost, consensus_scores[1].clone());
+        let c1 = Consensus::new(finalized_node.consensus1.to_vec(), consensus_cost, consensus_scores[0].clone());
+        let c2 = Consensus::new(finalized_node.consensus2.to_vec(), consensus_cost, consensus_scores[1].clone());
 
         // reformat the actual consensus assignments based on swappage, and build result
         let (consensus1, consensus2) = if swap_order {
@@ -314,7 +316,7 @@ impl<'a> DualConsensusDWFA<'a> {
         let initial_priority = initial_node.priority(self.consensus_cost());
 
         // start the priority queue, which defaults to bigger is better so we need a Reverse since want smaller costs
-        let mut pqueue: PriorityQueue<DualConsensusNode, NodePriority> = PriorityQueue::new();
+        let mut pqueue: PriorityQueue<DualConsensusNode, NodePriority, BuildHasherDefault<FxHasher>> = Default::default();
         single_tracker.insert(initial_node.max_consensus_length());
         pqueue.push(initial_node, initial_priority);
 
@@ -645,7 +647,7 @@ impl<'a> DualConsensusDWFA<'a> {
                         let new_priority = new_node.priority(self.consensus_cost());
                         assert!(new_node.is_dual);
                         dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
-                        assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                        assert!(pqueue.push(new_node, new_priority).is_none());
                     }
                 }
             } else {
@@ -675,7 +677,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     let new_priority = new_node.priority(self.consensus_cost());
                     assert!(!new_node.is_dual);
                     single_tracker.insert(new_node.max_consensus_length());
-                    assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                    assert!(pqueue.push(new_node, new_priority).is_none());
                 }
 
                 // now handle dual-node generation
@@ -728,7 +730,7 @@ impl<'a> DualConsensusDWFA<'a> {
                             let new_priority = new_node.priority(self.consensus_cost());
                             assert!(new_node.is_dual);
                             dual_tracker.insert(new_node.max_consensus_length());
-                            assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                            assert!(pqueue.push(new_node, new_priority).is_none());
                         }
                     }
                 }
@@ -801,7 +803,7 @@ impl<'a> DualConsensusDWFA<'a> {
 }
 
 /// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DualConsensusNode {
     /// if True, then this node is tracking two consensuses
     is_dual: bool,
@@ -810,13 +812,24 @@ struct DualConsensusNode {
     /// if True, we are not allowed to modify consensus2 anymore
     is_con2_locked: bool,
     /// The primary consensus sequence
-    consensus1: Vec<u8>,
+    consensus1: ConsensusPrefix,
     /// The secondary consensus sequence
-    consensus2: Vec<u8>,
+    consensus2: ConsensusPrefix,
     /// The set of DWFAs for consensus1; these are options because we stop tracking once the scores diverge
     dwfas1: Vec<Option<DWFALite>>,
     /// The set of DWFAs for consensus2; these are options because we stop tracking once the scores diverge
     dwfas2: Vec<Option<DWFALite>>,
+}
+
+impl Hash for DualConsensusNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Keep full-state equality while avoiding wavefront traversal on hashing.
+        self.is_dual.hash(state);
+        self.is_con1_locked.hash(state);
+        self.is_con2_locked.hash(state);
+        self.consensus1.hash(state);
+        self.consensus2.hash(state);
+    }
 }
 
 impl DualConsensusNode {
@@ -848,8 +861,8 @@ impl DualConsensusNode {
             is_dual: false,
             is_con1_locked: false,
             is_con2_locked: false,
-            consensus1: vec![],
-            consensus2: vec![],
+            consensus1: ConsensusPrefix::default(),
+            consensus2: ConsensusPrefix::default(),
             dwfas1: dwfas,
             dwfas2: vec![None; offsets.len()]
         })
@@ -1132,8 +1145,23 @@ impl DualConsensusNode {
 
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
-        let (_best_indices, best_costs) = self.costs(consensus_cost);
-        best_costs.iter().sum()
+        self.dwfas1.iter().zip(self.dwfas2.iter())
+            .map(|(dwfa1, dwfa2)| {
+                let mut best_score = usize::MAX;
+                for opt_d in [dwfa1, dwfa2] {
+                    if let Some(d) = opt_d {
+                        let score = match consensus_cost {
+                            ConsensusCost::L1Distance => d.edit_distance(),
+                            ConsensusCost::L2Distance => d.edit_distance().pow(2)
+                        };
+                        if score < best_score {
+                            best_score = score;
+                        }
+                    }
+                }
+                if best_score == usize::MAX { 0 } else { best_score }
+            })
+            .sum()
     }
 
     /// Returns the full set of tracked costs for the two consensuses.
