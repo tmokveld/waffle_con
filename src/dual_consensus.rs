@@ -304,6 +304,7 @@ impl<'a> DualConsensusDWFA<'a> {
         if initially_active == 0 {
             bail!("Must have at least one initial offset of None to see the consensus.");
         }
+        let mut candidate_scratch = crate::candidate_scratch::CandidateScratch::default();
         
         // we now track singletons and dual nodes separately so we can guarantee that we return _something_ even if final dual nodes are imbalanced
         let max_queue_size = self.config.max_queue_size;
@@ -517,7 +518,7 @@ impl<'a> DualConsensusDWFA<'a> {
             // this fetches the list of options according to the WFA so far
             // NOTE: this CAN include the wildcard, but only if the wildcard is the only character
             let weighted_by_ed = self.config.weighted_by_ed;
-            let extension_candidates1 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed);
+            let extension_candidates1 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed, &mut candidate_scratch);
             // let min_count1 = active_min_count[top_len];
             let min_count1 = self.config.min_count.max(
                 (self.config.min_af * extension_candidates1.values().sum::<f64>()).ceil() as u64
@@ -531,7 +532,7 @@ impl<'a> DualConsensusDWFA<'a> {
 
             if top_node.is_dual {
                 // get the second candidate set also
-                let extension_candidates2 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed);
+                let extension_candidates2 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed, &mut candidate_scratch);
                 // let min_count2 = active_min_count[top_len];
                 let min_count2 = self.config.min_count.max(
                     (self.config.min_af * extension_candidates2.values().sum::<f64>()).ceil() as u64
@@ -1267,7 +1268,7 @@ impl DualConsensusNode {
     /// * `wildcard` - an optional wildcard character, will be removed from return set unless it is the only value in it
     /// * `is_consensus1` - if True, this will check consensus1 DWFAs, otherwise it checks those for consensus2
     /// * `weighted_by_ed` - if True, then the weights are scaled based on the dual weights comparison; e.g. if ed1 = 2 and ed2 = 4, then weights for consensus 1 are ~1/3 and for consensus 2 are ~2/3 of the total
-    fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, is_consensus1: bool, weighted_by_ed: bool) -> HashMap<u8, f64> {
+    fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, is_consensus1: bool, weighted_by_ed: bool, scratch: &mut crate::candidate_scratch::CandidateScratch) -> HashMap<u8, f64> {
         // get the relevant DWFAs
         let dwfa_iter = if is_consensus1 {
             self.dwfas1.iter()
@@ -1295,11 +1296,11 @@ impl DualConsensusNode {
             if weight > 0.0 {
                 if let Some(dwfa) = opt_dwfa {
                     // get the candidates and the total observation weight
-                    let cand = dwfa.get_extension_candidates(baseline_seq, consensus_seq);
-                    let vote_split = cand.values().sum::<usize>() as f64;
+                    dwfa.fill_extension_candidates(baseline_seq, consensus_seq, scratch);
+                    let vote_split = scratch.ordered_counts().map(|(_, occ)| occ).sum::<usize>() as f64;
                     
                     // iterate over each candidate and scale it by the occurrences count / total weight
-                    for (&c, &occ) in cand.iter() {
+                    for (c, occ) in scratch.ordered_counts() {
                         let entry = candidates.entry(c).or_insert(0.0);
                         *entry += weight * occ as f64 / vote_split;
                     }
@@ -1384,6 +1385,78 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
+
+    #[test]
+    fn test_candidate_nomination_order_and_votes() {
+        fn check(node: &DualConsensusNode, reads: &[&[u8]], wildcard: Option<u8>, first: bool, weighted: bool, scratch: &mut crate::candidate_scratch::CandidateScratch) {
+            let dwfas = if first { &node.dwfas1 } else { &node.dwfas2 };
+            let consensus = if first { &node.consensus1 } else { &node.consensus2 };
+            let weights = if weighted { node.get_ed_weights(first, weighted) } else { vec![1.0; node.dwfas1.len()] };
+            let mut expected: HashMap<u8, f64> = Default::default();
+            for ((read, dwfa), &weight) in reads.iter().zip(dwfas).zip(&weights) {
+                if weight > 0.0 {
+                    if let Some(dwfa) = dwfa {
+                        let counts = dwfa.get_extension_candidates(read, consensus);
+                        let vote_split = counts.values().sum::<usize>() as f64;
+                        for (&symbol, &occ) in &counts {
+                            *expected.entry(symbol).or_insert(0.0) += weight * occ as f64 / vote_split;
+                        }
+                    }
+                }
+            }
+            if let Some(wc) = wildcard {
+                if expected.len() > 1 { expected.remove(&wc); }
+            }
+            let actual = node.get_extension_candidates(reads, wildcard, first, weighted, scratch);
+            let bits = |map: HashMap<u8, f64>| map.into_iter().map(|(b, v)| (b, v.to_bits())).collect::<Vec<_>>();
+            assert_eq!(bits(actual), bits(expected));
+        }
+
+        let mut scratch = crate::candidate_scratch::CandidateScratch::default();
+        for wildcard in [None, Some(b'*'), Some(0), Some(255)] {
+            for early in [false, true] {
+                let alphabet: Vec<u8> = (0..=255).collect();
+                let cases = [
+                    (vec![alphabet.clone()], alphabet.iter().rev().copied().collect::<Vec<_>>()),
+                    (vec![vec![0,255,0], vec![4,8,12,16], vec![255,0,4,8]], vec![255,0,0]),
+                    (vec![b"**".to_vec(); 3], b"**".to_vec()),
+                    (vec![b"A*".to_vec(), b"AC".to_vec(), b"AG".to_vec()], b"AC".to_vec()),
+                    (vec![vec![255]], vec![255]),
+                ];
+                for (mut owned, mut prefix) in cases {
+                    if let Some(wc) = wildcard {
+                        for byte in owned.iter_mut().flatten().chain(prefix.iter_mut()) {
+                            if *byte == b'*' { *byte = wc; }
+                        }
+                    }
+                    let reads: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+                    let mut node = DualConsensusNode::new_root_node(&vec![None; reads.len()], wildcard, early).unwrap();
+                    for weighted in [false, true] {
+                        check(&node, &reads, wildcard, true, weighted, &mut scratch);
+                    }
+                    for &symbol in &prefix {
+                        node.push(&reads, symbol, true).unwrap();
+                        for weighted in [false, true] {
+                            check(&node, &reads, wildcard, true, weighted, &mut scratch);
+                        }
+                    }
+                    node.activate_dual(&reads, 0, 255).unwrap();
+                    for weighted in [false, true] {
+                        for first in [true, false] {
+                            check(&node, &reads, wildcard, first, weighted, &mut scratch);
+                        }
+                    }
+                    node.push(&reads, 4, true).unwrap();
+                    node.push(&reads, 8, false).unwrap();
+                    for weighted in [false, true] {
+                        for first in [true, false] {
+                            check(&node, &reads, wildcard, first, weighted, &mut scratch);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // first some more targeted tests
     #[test]
