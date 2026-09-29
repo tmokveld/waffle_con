@@ -593,6 +593,27 @@ mod tests {
     use crate::cdwfa_config::CdwfaConfigBuilder;
 
     #[test]
+    fn test_global_scores_after_finalization() {
+        let inputs = [b"AC", b"AC", b"AC", b"CA"];
+        let mut consensus_dwfa = ConsensusDWFA::default();
+        for input in inputs {
+            consensus_dwfa.add_sequence(input).unwrap();
+        }
+        let results = consensus_dwfa.consensus().unwrap();
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.sequence(), b"AC");
+        assert_eq!(result.scores(), &[0, 0, 0, 2]);
+        for (input, &score) in inputs.iter().zip(result.scores()) {
+            assert_eq!(
+                score,
+                crate::sequence_alignment::wfa_ed_config(result.sequence(), *input, true, None),
+                "input={input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_queue_hash_collision_keeps_distinct_states() {
         let cost = ConsensusCost::L1Distance;
         let mut first = ConsensusNode::new_root_node(&[None], None, false).unwrap();

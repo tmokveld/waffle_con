@@ -176,22 +176,45 @@ impl DWFALite {
     }
 
     /// This function signals that base insertion into `other_seq` is completed.
-    /// This will trigger the algorithm to make sure we have reached the end of both the `baseline_seq`, potentially increasing edit distance further.
-    /// Note: other_seq should already be at the end UNLESS we allow_early_termination
+    /// Ordinary mode requires one alignment path to consume both sequences, potentially increasing edit distance.
+    /// Early-termination mode requires only the baseline to finish, leaving the other sequence's suffix unpenalized.
+    /// Callers must first successfully update with these sequences and a valid offset.
+    /// Successful finalization seals the instance against further updates or finalization.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
     /// # Errors
-    /// * If the edit distance cannot be increased further and it needs to be.
+    /// * If the DWFA is already finalized.
     pub fn finalize(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         if self.is_finalized {
             bail!("Cannot finalize a DWFA twice.");
         }
-        while self.maximum_baseline_distance() < baseline_seq.len() {
-            // while we have not reached the end of the primary sequence
-            self.increase_edit_distance(baseline_seq, other_seq)?;
+        if self.allow_early_termination {
+            while self.maximum_baseline_distance() < baseline_seq.len() {
+                self.increase_edit_distance(baseline_seq, other_seq)?;
+            }
+        } else {
+            while !self.reached_global_end(baseline_seq.len(), other_seq.len()) {
+                self.increase_edit_distance(baseline_seq, other_seq)?;
+            }
         }
+        self.is_finalized = true;
         Ok(())
+    }
+
+    /// Checks that one path reaches both ends on the terminal diagonal.
+    fn reached_global_end(&self, baseline_len: usize, other_len: usize) -> bool {
+        let effective_other_len = other_len - self.offset;
+        let gap = effective_other_len.abs_diff(baseline_len);
+        if gap > self.edit_distance {
+            return false;
+        }
+        let index = if effective_other_len >= baseline_len {
+            self.edit_distance + gap
+        } else {
+            self.edit_distance - gap
+        };
+        self.wavefront[index] >= effective_other_len
     }
 
     /// Helper function that will determine the farthest distance reached into the `baseline_seq` so far.
@@ -252,6 +275,121 @@ impl DWFALite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_finalize_endpoint_modes() {
+        let cases: &[(&[u8], &[u8], usize, usize, usize)] = &[
+            (b"AC", b"CA", 0, 2, 1),
+            (b"AC", b"ACTT", 0, 2, 0),
+            (b"ACTT", b"AC", 0, 2, 2),
+            (b"AC", b"GGCA", 2, 2, 1),
+            (b"AC", b"GGACTT", 2, 2, 0),
+        ];
+        for &(baseline, other, offset, global_score, early_score) in cases {
+            for early in [false, true] {
+                for incremental in [false, true] {
+                    let mut dwfa = DWFALite::new(None, early);
+                    dwfa.set_offset(offset);
+                    if incremental {
+                        for length in offset..=other.len() {
+                            dwfa.update(baseline, &other[..length]).unwrap();
+                        }
+                    } else {
+                        dwfa.update(baseline, other).unwrap();
+                    }
+                    dwfa.finalize(baseline, other).unwrap();
+                    assert_eq!(
+                        dwfa.edit_distance(), if early { early_score } else { global_score },
+                        "baseline={baseline:?}, other={other:?}, offset={offset}, early={early}, incremental={incremental}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_finalize_matches_pairwise_oracle() {
+        let sequences: Vec<Vec<u8>> = (0..=4)
+            .flat_map(|length| {
+                (0..1usize << length).map(move |bits| {
+                    (0..length).map(|i| b"AC"[(bits >> i) & 1]).collect()
+                })
+            })
+            .collect();
+        for baseline in &sequences {
+            for suffix in &sequences {
+                for offset in [0, 2] {
+                    let mut other = vec![b'G'; offset];
+                    other.extend_from_slice(suffix);
+                    for early in [false, true] {
+                        let expected = crate::sequence_alignment::wfa_ed_config(
+                            &other[offset..], baseline, !early, None
+                        );
+                        for incremental in [false, true] {
+                            let mut dwfa = DWFALite::new(None, early);
+                            dwfa.set_offset(offset);
+                            if incremental {
+                                for length in offset..=other.len() {
+                                    dwfa.update(baseline, &other[..length]).unwrap();
+                                }
+                            } else {
+                                dwfa.update(baseline, &other).unwrap();
+                            }
+                            dwfa.finalize(baseline, &other).unwrap();
+                            assert_eq!(
+                                dwfa.edit_distance(), expected,
+                                "baseline={baseline:?}, other={other:?}, offset={offset}, early={early}, incremental={incremental}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_finalize_clone_isolation() {
+        let mut live = DWFALite::default();
+        live.update(b"AC", b"A").unwrap();
+        let mut finalized = live.clone();
+        finalized.finalize(b"AC", b"A").unwrap();
+        assert_eq!(finalized.edit_distance(), 1);
+
+        live.update(b"AC", b"AC").unwrap();
+        live.finalize(b"AC", b"AC").unwrap();
+        assert_eq!(live.edit_distance(), 0);
+
+        let mut sealed_clone = finalized.clone();
+        assert!(sealed_clone.finalize(b"AC", b"A").is_err());
+        assert_eq!(sealed_clone, finalized);
+        assert!(sealed_clone.update(b"AC", b"AC").is_err());
+        assert_eq!(sealed_clone, finalized);
+    }
+
+    #[test]
+    fn test_finalize_global_endpoint() {
+        let mut dwfa = DWFALite::default();
+        assert_eq!(dwfa.update(b"AC", b"CA").unwrap(), 1);
+        dwfa.finalize(b"AC", b"CA").unwrap();
+        assert_eq!(dwfa.edit_distance(), 2);
+    }
+
+    #[test]
+    fn test_finalize_seals_alignment() {
+        for early in [false, true] {
+            for (baseline, expected) in [(b"AC".as_slice(), 0), (b"ACTT".as_slice(), 2)] {
+                let mut dwfa = DWFALite::new(None, early);
+                assert_eq!(dwfa.update(baseline, b"AC").unwrap(), 0);
+                dwfa.finalize(baseline, b"AC").unwrap();
+                assert_eq!(dwfa.edit_distance(), expected);
+                let snapshot = dwfa.clone();
+                assert!(dwfa.finalize(baseline, b"AC").is_err());
+                assert_eq!(dwfa, snapshot);
+                assert!(dwfa.update(baseline, b"ACA").is_err());
+                assert_eq!(dwfa, snapshot);
+            }
+        }
+    }
 
     #[test]
     fn test_incremental_reach_with_offset_and_early_termination() {
