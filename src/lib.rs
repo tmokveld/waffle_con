@@ -40,7 +40,6 @@ mod candidate_scratch;
 pub mod cdwfa_config;
 /// Main functionality for the consensus component
 pub mod consensus;
-mod consensus_prefix;
 /// Functionality for a 2-way consensus
 pub mod dual_consensus;
 /// Main functionality for a dynamic WFA, which will just focus on a single string
