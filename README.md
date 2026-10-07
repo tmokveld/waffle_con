@@ -35,6 +35,40 @@ Then the best score is used for each input sequence when calculating the edit di
 This can be further split into a multi-consensus by repeatedly running dual-consensus in a binary-tree like system (e.g., repeatedly split the sequences into groups until they do not want to split further).
 Finally, priority consensus is just multi-consensus on a chain of sequence inputs instead of a single sequence input.
 
+## Edit-distance limits
+Per-read edit-distance limits can stop divergent reads from increasing the alignment workload.
+They are disabled by default. Configure them through `CdwfaConfig` or `CdwfaConfigBuilder`:
+
+```rust
+use waffle_con::cdwfa_config::CdwfaConfigBuilder;
+use waffle_con::consensus::ConsensusDWFA;
+
+let config = CdwfaConfigBuilder::default()
+    .max_edit_distance(Some(100))
+    .max_edit_distance_fraction(Some(0.05))
+    .min_edit_distance(Some(5))
+    .build()
+    .unwrap();
+let mut consensus = ConsensusDWFA::with_config(config).unwrap();
+consensus.add_sequence(b"ACGTACGT").unwrap();
+let results = consensus.consensus().unwrap();
+assert_eq!(results[0].sequence(), b"ACGTACGT");
+```
+
+The resolved cap is the tighter of the absolute limit and `floor(fraction * read_length)`, then raised to the optional minimum.
+The minimum alone does not enable a cap. A read that needs to exceed its cap freezes at that distance and stops nominating extensions.
+Its reported score is capped, not an exact edit distance; the configured L1 or L2 cost transformation still applies.
+
+Single-consensus results expose `assignments()`: `None` means all reads were included; otherwise each read is marked `Included` or `EditDistanceLimit`.
+Dual-consensus results use `SequenceAssignment::{Consensus1, Consensus2, EqualScore, EditDistanceLimit}`.
+Only reads assigned to an allele appear in that allele's score list; per-read scores remain available through `scores1()` and `scores2()`.
+Priority consensus retains upstream's grouping behavior: ties and edit-distance-limited reads join the first group when a split occurs.
+
+### API changes in the unreleased integration
+* `DWFALite::new` now accepts `DWFALiteConfig` rather than separate wildcard and early-termination arguments.
+* `Consensus::new(sequence, cost, scores, assignments)` now returns a `Result`; pass `None` when all reads are included.
+* Use dual-consensus `assignments()` instead of the former boolean `is_consensus1()` API, handling ties and excluded reads explicitly.
+
 ## Limitations
 `waffle_con` has been designed for the specific purpose of PGx consensus in StarPhase using long, accurate HiFi reads.
 The underlying algorithms rely on a basic edit-distance wavefront algorithm, which scales with the total edit distance between two sequences.
