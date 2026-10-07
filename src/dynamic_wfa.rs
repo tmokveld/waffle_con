@@ -1,6 +1,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use simple_error::bail;
+use crate::candidate_scratch::CandidateScratch;
 
 /// The core dynamic WFA structure for a lite implementation.
 /// It is structured such that all the sequences being built are maintained **outside** of this struct (hence the "lite").
@@ -248,18 +249,28 @@ impl DWFALite {
     /// * `other_seq` - the other sequence, typically getting updates
     pub fn get_extension_candidates(&self, baseline_seq: &[u8], other_seq: &[u8]) -> HashMap<u8, usize> {
         let mut ret: HashMap<u8, usize> = Default::default();
+        self.for_each_extension_candidate(baseline_seq, other_seq, |symbol| {
+            let entry = ret.entry(symbol).or_insert(0);
+            *entry += 1;
+        });
+        ret
+    }
+
+    pub(crate) fn fill_extension_candidates(&self, baseline_seq: &[u8], other_seq: &[u8], scratch: &mut CandidateScratch) {
+        scratch.reset();
+        self.for_each_extension_candidate(baseline_seq, other_seq, |symbol| scratch.record(symbol));
+    }
+
+    fn for_each_extension_candidate(&self, baseline_seq: &[u8], other_seq: &[u8], mut record: impl FnMut(u8)) {
         for (i, &d) in self.wavefront.iter().enumerate() {
             let other_offset = d + self.offset;
             if other_offset == other_seq.len() {
                 let offset = d + self.edit_distance - i;
                 if offset < baseline_seq.len() {
-                    // ret.insert(baseline_seq[offset]);
-                    let entry = ret.entry(baseline_seq[offset]).or_insert(0);
-                    *entry += 1;
+                    record(baseline_seq[offset]);
                 }
             }
         }
-        ret
     }
 
     // Getters below

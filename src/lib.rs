@@ -35,6 +35,7 @@ assert_eq!(consensuses[0].scores(), &[1, 0, 1]);
 ```
 */
 
+mod candidate_scratch;
 /// Configuration for ConsensusDWFA
 pub mod cdwfa_config;
 /// Main functionality for the consensus component

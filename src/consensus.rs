@@ -221,6 +221,7 @@ impl<'a> ConsensusDWFA<'a> {
         pqueue.push(initial_node, initial_priority);
 
         let mut ret = vec![];
+        let mut candidate_scratch = crate::candidate_scratch::CandidateScratch::default();
 
         // the way this will work is that we will eventually find one or more answers and anything worse will get drained off until no possibilities remain
         while !pqueue.is_empty() {
@@ -282,7 +283,7 @@ impl<'a> ConsensusDWFA<'a> {
 
             // this fetches the list of options according to the WFA so far
             // NOTE: this CAN include the wildcard, but only if the wildcard is the only character
-            let extension_candidates = top_node.get_extension_candidates(&self.sequences, self.config.wildcard);
+            let extension_candidates = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, &mut candidate_scratch);
             let max_observed = extension_candidates.values().cloned().max_by(|a, b| a.total_cmp(b))
                 // if no observation, then just use min count
                 .unwrap_or(self.config.min_count as f64);
@@ -554,16 +555,16 @@ impl ConsensusNode {
     /// # Arguments
     /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * `wildcard` - an optional wildcard character, will be removed from return set unless it is the only value in it
-    fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>) -> HashMap<u8, f64> {
+    fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, scratch: &mut crate::candidate_scratch::CandidateScratch) -> HashMap<u8, f64> {
         let mut candidates: HashMap<u8, f64> = Default::default();
         for (baseline_seq, opt_dwfa) in baseline_sequences.iter().zip(self.dwfas.iter()) {
             if let Some(dwfa) = opt_dwfa.as_ref() {
                 // get the candidates and the total observation weight
-                let cand = dwfa.get_extension_candidates(baseline_seq, &self.consensus);
-                let vote_split = cand.values().sum::<usize>() as f64;
+                dwfa.fill_extension_candidates(baseline_seq, &self.consensus, scratch);
+                let vote_split = scratch.ordered_counts().map(|(_, occ)| occ).sum::<usize>() as f64;
                 
                 // iterate over each candidate and scale it by the occurrences count / total weight
-                for (&c, &occ) in cand.iter() {
+                for (c, occ) in scratch.ordered_counts() {
                     let entry = candidates.entry(c).or_insert(0.0);
                     *entry += occ as f64 / vote_split;
                 }
@@ -591,6 +592,56 @@ mod tests {
     use super::*;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
+
+    #[test]
+    fn test_candidate_nomination_order_and_votes() {
+        fn check(node: &ConsensusNode, reads: &[&[u8]], wildcard: Option<u8>, scratch: &mut crate::candidate_scratch::CandidateScratch) {
+            let mut expected: HashMap<u8, f64> = Default::default();
+            for (read, dwfa) in reads.iter().zip(&node.dwfas) {
+                if let Some(dwfa) = dwfa {
+                    let counts = dwfa.get_extension_candidates(read, &node.consensus);
+                    let vote_split = counts.values().sum::<usize>() as f64;
+                    for (&symbol, &occ) in &counts {
+                        *expected.entry(symbol).or_insert(0.0) += occ as f64 / vote_split;
+                    }
+                }
+            }
+            if let Some(wc) = wildcard {
+                if expected.len() > 1 { expected.remove(&wc); }
+            }
+            let actual = node.get_extension_candidates(reads, wildcard, scratch);
+            let bits = |map: HashMap<u8, f64>| map.into_iter().map(|(b, v)| (b, v.to_bits())).collect::<Vec<_>>();
+            assert_eq!(bits(actual), bits(expected));
+        }
+
+        let mut scratch = crate::candidate_scratch::CandidateScratch::default();
+        for wildcard in [None, Some(b'*'), Some(0), Some(255)] {
+            for early in [false, true] {
+                let alphabet: Vec<u8> = (0..=255).collect();
+                let cases = [
+                    (vec![alphabet.clone()], alphabet.iter().rev().copied().collect::<Vec<_>>()),
+                    (vec![vec![0,255,0], vec![4,8,12,16], vec![255,0,4,8]], vec![255,0,0]),
+                    (vec![b"**".to_vec(); 3], b"**".to_vec()),
+                    (vec![b"A*".to_vec(), b"AC".to_vec(), b"AG".to_vec()], b"AC".to_vec()),
+                    (vec![vec![255]], vec![255]),
+                ];
+                for (mut owned, mut prefix) in cases {
+                    if let Some(wc) = wildcard {
+                        for byte in owned.iter_mut().flatten().chain(prefix.iter_mut()) {
+                            if *byte == b'*' { *byte = wc; }
+                        }
+                    }
+                    let reads: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+                    let mut node = ConsensusNode::new_root_node(&vec![None; reads.len()], wildcard, early).unwrap();
+                    check(&node, &reads, wildcard, &mut scratch);
+                    for symbol in prefix {
+                        node.push(&reads, symbol).unwrap();
+                        check(&node, &reads, wildcard, &mut scratch);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_global_scores_after_finalization() {
