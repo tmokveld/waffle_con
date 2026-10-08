@@ -4,6 +4,8 @@ use simple_error::bail;
 use std::hash::{Hash, Hasher};
 use crate::candidate_scratch::CandidateScratch;
 
+const FRONTIER_MIN_WIDTH: usize = 33;
+
 /// Lifecycle of a [`DWFALite`].
 /// A DWFA starts [`Active`](DWFALiteState::Active). 
 /// Finalizing it or passing the edit-distance cap moves it out of that state.
@@ -59,7 +61,8 @@ impl Default for DWFALiteConfig {
 /// It is structured such that all the sequences being built are maintained **outside** of this struct (hence the "lite").
 /// Essentially, it is keep the wavefront information, but all sequences are updated and tracked elsewhere.
 /// As a result, all updates must pass the sequences so the information can get tracked.
-/// If the outside sequences are changed in any way other than appending, then this may become desynchronized.
+/// `baseline_seq` must be identical on every call. `other_seq` may only grow by appending;
+/// previously supplied bytes must not change. Mutating or growing the baseline is unsupported.
 /// Conceptually, if this is a 2D grid, the baseline sequence will go from top to bottom (y-axis) and the other sequence will go from left to right (x-axis).
 /// This means each character we add to `other_seq` will add a new _column_ to the grid.
 #[derive(Clone, Debug, Eq)]
@@ -84,6 +87,8 @@ pub struct DWFALite {
     max_baseline: usize,
     /// Relative to `offset`.
     max_other: usize,
+    /// Bounds every slot at `max_other`; empty means a full scan is required.
+    extension_range: std::ops::Range<usize>,
 }
 
 impl PartialEq for DWFALite {
@@ -116,6 +121,7 @@ impl Default for DWFALite {
             offset: 0,
             max_baseline: 0,
             max_other: 0,
+            extension_range: 0..0,
         }
     }
 }
@@ -138,14 +144,15 @@ impl DWFALite {
     /// * `offset` - the number of characters to ignore
     pub fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
+        self.extension_range = 0..0;
     }
 
     /// This is the main function to extend the WFA with a new symbol.
     /// This function will handle all of the extending and potential edit distance increases as well.
     /// If another edit would exceed the configured cap, the distance freezes at the cap and the DWFA stops voting.
     /// # Arguments
-    /// * `baseline_seq` - the baseline sequence, theoretically fixed
-    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `baseline_seq` - must be identical on every call; neither mutation nor growth is supported
+    /// * `other_seq` - may only grow by appending; previously supplied bytes must not change
     /// # Errors
     /// * If this function is called after `finalize()` has been called.
     pub fn update(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
@@ -186,6 +193,14 @@ impl DWFALite {
     ///
     /// Returns the maximum reach into `other_seq` after extending every diagonal.
     fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> usize {
+        if self.wavefront.len() < FRONTIER_MIN_WIDTH {
+            self.extend_full(baseline_seq, other_seq)
+        } else {
+            self.extend_frontier(baseline_seq, other_seq)
+        }
+    }
+
+    fn extend_full(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> usize {
         let mut maximum_distance = 0;
         let mut maximum_baseline = 0;
 
@@ -234,6 +249,49 @@ impl DWFALite {
         self.offset + maximum_distance
     }
 
+    // Keep the measured branch layout; Rust 1.85 enables this lint by default.
+    #[allow(clippy::comparison_chain)]
+    fn extend_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> usize {
+        let valid = !self.extension_range.is_empty();
+        let range = if valid {
+            self.extension_range.clone()
+        } else {
+            0..self.wavefront.len()
+        };
+        // Untouched lanes cannot advance, but may still own the baseline maximum.
+        let mut maximum_baseline = if valid { self.max_baseline } else { 0 };
+        let mut maximum_distance = 0;
+        let mut first = range.start;
+        let mut last = range.start;
+        for (relative_index, d) in self.wavefront[range.clone()].iter_mut().enumerate() {
+            let i = range.start + relative_index;
+            loop {
+                let baseline_offset = *d + self.edit_distance - i;
+                let other_offset = *d + self.offset;
+                if baseline_offset >= baseline_seq.len()
+                    || other_offset >= other_seq.len()
+                    || (baseline_seq[baseline_offset] != other_seq[other_offset]
+                        && self.config.wildcard.is_none_or(|wildcard| baseline_seq[baseline_offset] != wildcard))
+                {
+                    break;
+                }
+                *d += 1;
+            }
+            if *d > maximum_distance {
+                maximum_distance = *d;
+                first = i;
+                last = i;
+            } else if *d == maximum_distance {
+                last = i;
+            }
+            maximum_baseline = maximum_baseline.max(*d + self.edit_distance - i);
+        }
+        self.max_baseline = maximum_baseline;
+        self.max_other = maximum_distance;
+        self.extension_range = first..last + 1;
+        self.offset + maximum_distance
+    }
+
     /// This will increase the edit distance for this DWFA and create a new larger wavefront.
     /// This function will automatically call `extend()` to enforce the assumptions.
     /// # Arguments
@@ -265,6 +323,7 @@ impl DWFALite {
             self.wavefront[i + 2] = self.wavefront[i + 2].max(advanced);
         }
 
+        self.extension_range = 0..0;
         // re-extend
         Ok(self.extend(baseline_seq, other_seq))
     }
@@ -277,8 +336,8 @@ impl DWFALite {
     /// If reaching the required endpoint would exceed the cap, returns successfully in
     /// [`ExceededEditDistanceLimit`](DWFALiteState::ExceededEditDistanceLimit) with the distance frozen at the cap.
     /// # Arguments
-    /// * `baseline_seq` - the baseline sequence, theoretically fixed
-    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `baseline_seq` - the unchanged baseline supplied to `update`
+    /// * `other_seq` - the same append-only sequence supplied to the last successful `update`
     /// # Errors
     /// * If the DWFA is already finalized.
     pub fn finalize(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
@@ -346,8 +405,8 @@ impl DWFALite {
     /// Inactive DWFAs do not nominate extensions.
     /// It also includes how many times that character was counted in the event of multiple possible extension points.
     /// # Arguments
-    /// * `baseline_seq` - the baseline sequence, theoretically fixed
-    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `baseline_seq` - the unchanged baseline supplied to `update`; neither mutation nor growth is supported
+    /// * `other_seq` - the current append-only sequence or an unchanged older prefix
     pub fn get_extension_candidates(&self, baseline_seq: &[u8], other_seq: &[u8]) -> HashMap<u8, usize> {
         let mut ret: HashMap<u8, usize> = Default::default();
         self.for_each_extension_candidate(baseline_seq, other_seq, |symbol| {
@@ -366,7 +425,13 @@ impl DWFALite {
         if self.state != DWFALiteState::Active {
             return;
         }
-        for (i, &d) in self.wavefront.iter().enumerate() {
+        let range = if !self.extension_range.is_empty() && other_seq.len() == self.offset + self.max_other {
+            self.extension_range.clone()
+        } else {
+            0..self.wavefront.len()
+        };
+        for (relative_index, &d) in self.wavefront[range.clone()].iter().enumerate() {
+            let i = range.start + relative_index;
             let other_offset = d + self.offset;
             if other_offset == other_seq.len() {
                 let offset = d + self.edit_distance - i;
@@ -421,8 +486,17 @@ mod tests {
                 .map(|(i, &d)| d + actual.edit_distance() - i).max().unwrap());
             assert_eq!(actual.maximum_other_distance(), offset + actual.wavefront().iter().max().unwrap());
             for length in offset..=other.len() {
-                assert_eq!(actual.get_extension_candidates(baseline, &other[..length]),
-                    expected.get_extension_candidates(baseline, &other[..length]));
+                let mut nominations = HashMap::default();
+                if actual.state() == DWFALiteState::Active {
+                    for (i, &distance) in actual.wavefront().iter().enumerate() {
+                        let baseline_index = distance + actual.edit_distance() - i;
+                        if offset + distance == length && baseline_index < baseline.len() {
+                            *nominations.entry(baseline[baseline_index]).or_insert(0) += 1;
+                        }
+                    }
+                }
+                assert_eq!(actual.get_extension_candidates(baseline, &other[..length]), nominations);
+                assert_eq!(expected.get_extension_candidates(baseline, &other[..length]), nominations);
             }
         }
 
@@ -473,15 +547,124 @@ mod tests {
                 }
             }
         }
+
+        let pattern: Vec<u8> = (0..160).map(|i| (i * 37) as u8).collect();
+        let changed = |length: usize| {
+            let mut other = pattern.clone();
+            for byte in &mut other[..length] { *byte ^= 0x80; }
+            other
+        };
+        let run_wide = |baseline: &[u8], other: &[u8], config: DWFALiteConfig, offset: usize, chunk: usize| {
+            let mut actual = DWFALite::new(config.clone());
+            actual.set_offset(offset);
+            let mut length = offset;
+            loop {
+                let prefix = &other[..length];
+                let mut expected = DWFALite::new(config.clone());
+                expected.set_offset(offset);
+                expected.update(baseline, prefix).unwrap();
+                for _ in 0..2 {
+                    if actual.state() == DWFALiteState::Active && actual.wavefront().len() >= FRONTIER_MIN_WIDTH {
+                        let mut scalar = actual.clone();
+                        scalar.extension_range = 0..0;
+                        let scalar_reach = scalar.extend_full(baseline, prefix);
+                        for clear_cache in [false, true] {
+                            let mut frontier = actual.clone();
+                            if clear_cache { frontier.extension_range = 0..0; }
+                            assert_eq!(frontier.extend_frontier(baseline, prefix), scalar_reach);
+                            assert_public_state(&frontier, &scalar, baseline, prefix, offset);
+                        }
+                    }
+                    actual.update(baseline, prefix).unwrap();
+                    assert_public_state(&actual, &expected, baseline, prefix, offset);
+                }
+                if length == other.len() { break; }
+                length = (length + chunk).min(other.len());
+            }
+            let mut expected = DWFALite::new(config);
+            expected.set_offset(offset);
+            expected.update(baseline, other).unwrap();
+            actual.finalize(baseline, other).unwrap();
+            expected.finalize(baseline, other).unwrap();
+            assert_public_state(&actual, &expected, baseline, other, offset);
+        };
+        for leading in [15, 16, 17, 31, 32, 33, 63, 64, 65] {
+            for chunk in [1, 7] {
+                run_wide(&pattern, &changed(leading), dwfa_config(None, false, None), 0, chunk);
+            }
+        }
+        let inserted: Vec<u8> = [vec![254; 20], pattern.clone()].concat();
+        let separated_baseline: Vec<u8> = [vec![0; 65], b"ACA".to_vec()].concat();
+        let mut separated_other: Vec<u8> = [vec![255; 65], b"CA".to_vec()].concat();
+        let mut reference = DWFALite::default();
+        reference.update(&separated_baseline, &separated_other).unwrap();
+        assert_eq!(reference.edit_distance(), 66);
+        assert_eq!(reference.wavefront().iter().enumerate()
+            .filter_map(|(i, &d)| (d == reference.max_other).then_some(i)).collect::<Vec<_>>(), vec![65, 67]);
+        separated_other.push(b'C');
+        for chunk in [1, 7] {
+            run_wide(&pattern, &inserted, dwfa_config(None, false, None), 0, chunk);
+            run_wide(&pattern, &pattern[20..], dwfa_config(None, false, None), 0, chunk);
+            run_wide(&separated_baseline, &separated_other, dwfa_config(None, false, None), 0, chunk);
+        }
+        let other = changed(65);
+        let offset_other: Vec<u8> = [vec![77; 2], other.clone()].concat();
+        run_wide(&pattern, &offset_other, dwfa_config(None, false, None), 2, 1);
+        run_wide(&pattern, &other, dwfa_config(None, true, None), 0, 1);
+        let mut wildcard_baseline = pattern.clone();
+        wildcard_baseline[70] = 42;
+        run_wide(&wildcard_baseline, &other, dwfa_config(Some(42), false, None), 0, 1);
+        let mut wildcard_other = other.clone();
+        wildcard_other[70] = 42;
+        run_wide(&pattern, &wildcard_other, dwfa_config(Some(42), false, None), 0, 1);
+        for cap in [15, 16, 17, 31, 32, 33, 63, 64, 65] {
+            run_wide(&pattern, &other, dwfa_config(None, false, Some(cap)), 0, 1);
+        }
+        let mut live = DWFALite::default();
+        for length in 0..=100 { live.update(&pattern, &other[..length]).unwrap(); }
+        let mut first = live.clone();
+        let mut second = live.clone();
+        let mut first_prefix = other[..100].to_vec();
+        let mut second_prefix = first_prefix.clone();
+        first_prefix.push(0);
+        second_prefix.push(255);
+        first.update(&pattern, &first_prefix).unwrap();
+        second.update(&pattern, &second_prefix).unwrap();
+        let mut first_reference = DWFALite::default();
+        first_reference.update(&pattern, &first_prefix).unwrap();
+        assert_public_state(&first, &first_reference, &pattern, &first_prefix, 0);
+        let mut second_reference = DWFALite::default();
+        second_reference.update(&pattern, &second_prefix).unwrap();
+        assert_public_state(&second, &second_reference, &pattern, &second_prefix, 0);
+        first.finalize(&pattern, &first_prefix).unwrap();
+        first_reference.finalize(&pattern, &first_prefix).unwrap();
+        assert_public_state(&first, &first_reference, &pattern, &first_prefix, 0);
+        second_prefix.push(7);
+        second.update(&pattern, &second_prefix).unwrap();
+        second_reference = DWFALite::default();
+        second_reference.update(&pattern, &second_prefix).unwrap();
+        assert_public_state(&second, &second_reference, &pattern, &second_prefix, 0);
+        second.finalize(&pattern, &second_prefix).unwrap();
+        second_reference.finalize(&pattern, &second_prefix).unwrap();
+        assert_public_state(&second, &second_reference, &pattern, &second_prefix, 0);
+
+        let mut older = DWFALite::default();
+        older.update(&[0, 0], &[255]).unwrap();
+        assert_eq!(older.get_extension_candidates(&[0, 0], &[]), HashMap::from_iter([(0, 1)]));
     }
 
     #[test]
     fn test_frontier_cache_preserves_hash_identity() {
         let mut original = DWFALite::default();
-        original.update(&[0, 0], &[255]).unwrap();
+        let baseline: Vec<u8> = [vec![0; 65], b"ACA".to_vec()].concat();
+        let other: Vec<u8> = [vec![255; 65], b"CA".to_vec()].concat();
+        original.update(&baseline, &other).unwrap();
+        assert!(original.wavefront().len() >= FRONTIER_MIN_WIDTH);
+        assert!(!original.extension_range.is_empty());
         let mut retargeted = original.clone();
         retargeted.set_offset(1);
         retargeted.set_offset(0);
+        assert!(retargeted.extension_range.is_empty());
         assert_eq!(original, retargeted);
         let mut set = std::collections::HashSet::new();
         set.insert(original);

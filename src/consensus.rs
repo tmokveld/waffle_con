@@ -768,6 +768,19 @@ mod tests {
                 }
             }
         }
+
+        // Reuse per-read scratch across growth boundaries, duplicate reads,
+        // wildcard removal, and large -> small -> empty nomination sets.
+        for size in [256, 3, 0, 4, 7, 8, 14, 15, 28, 29, 56, 57, 112, 113, 224, 225, 256, 1, 0] {
+            let mut owned: Vec<Vec<u8>> = (0..size).flat_map(|b| [vec![b as u8], vec![b as u8]]).collect();
+            if owned.is_empty() { owned.push(vec![]); }
+            let reads: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            for wildcard in [None, Some(0), Some(255)] {
+                let config = CdwfaConfigBuilder::default().wildcard(wildcard).build().unwrap();
+                let node = ConsensusNode::new_root_node(&reads, &vec![None; reads.len()], &config).unwrap();
+                check(&node, &reads, wildcard, &mut scratch);
+            }
+        }
     }
 
     #[test]
