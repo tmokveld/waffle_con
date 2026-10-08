@@ -52,6 +52,7 @@ assert_eq!(consensuses.sequence_indices(), &[
 */
 
 use itertools::Itertools;
+#[cfg(feature = "logging")]
 use log::debug;
 use rustc_hash::FxHashSet as HashSet;
 use simple_error::bail;
@@ -199,6 +200,7 @@ impl<'a> PriorityConsensusDWFA<'a> {
 
             // build a dual consensus DWFA for these sequences
             let mut dc_dwfa = DualConsensusDWFA::with_config(self.config.clone())?;
+            #[cfg(feature = "logging")]
             debug!("Calling Dual at level {current_split_level} with: {include_set:?}");
 
             for (&include, (seq, offset)) in include_set.iter().zip(self.sequences.iter().zip(self.offsets.iter())) {
@@ -209,11 +211,13 @@ impl<'a> PriorityConsensusDWFA<'a> {
 
             // now solve it
             let dc_result = dc_dwfa.consensus()?;
+            #[cfg(feature = "logging")]
             if dc_result.len() > 1 {
                 debug!("Multiple dual consensuses detected, arbitrarily selecting first option.");
             }
             
             let chosen_result = &dc_result[0];
+            #[cfg(feature = "logging")]
             debug!("Parsing result with {} consensuses...", if chosen_result.is_dual() { 2 } else { 1 });
 
             /*

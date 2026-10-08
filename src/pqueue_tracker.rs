@@ -1,4 +1,5 @@
 
+#[cfg(feature = "logging")]
 use log::trace;
 use simple_error::bail;
 
@@ -70,11 +71,13 @@ impl PQueueTracker {
     /// * `new_threshold` - the new minimum threshold to track, must be >= current threshold
     pub fn increase_threshold(&mut self, new_threshold: usize) {
         assert!(new_threshold >= self.threshold);
+        #[cfg(feature = "logging")]
         trace!("increase_threshold => {}, size = {}", self.threshold, self.total_count);
         for t in self.threshold..new_threshold {
             self.total_count -= self.length_counts[t];
         }
         self.threshold = new_threshold;
+        #[cfg(feature = "logging")]
         trace!("increase_threshold => {}, size = {}", self.threshold, self.total_count);
     }
 

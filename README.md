@@ -12,9 +12,29 @@ This crate contains functionality for:
 * DualConsensusDWFA - One input string per sequence, 1 or 2 output sequences
 * PriorityConsensuDWFA - Multiple input strings per sequence (priority), 1+ output sequences
 
+## Requirements
+Rust 1.85.1 or newer is required.
+
 ## Full documentation
 `waffle_con` provides extensive in-line documentation.
 A user-friendly HTML version can be generated via `cargo doc`.
+
+## Logging
+The `logging` Cargo feature is enabled by default. It sends diagnostics through the [`log` facade](https://docs.rs/log/);
+the application chooses and initializes its logger and controls filtering. This library does not initialize a logger.
+Without an initialized logger, it produces no log output.
+
+Set `default-features = false` on the `waffle_con` dependency to compile out its logging calls, logging-only search statistics,
+and normal `log` dependency. All consensus functionality remains available. To enable logging explicitly while leaving
+other default features disabled, also set `features = ["logging"]`.
+Cargo features are additive: another dependency enabling `waffle_con/logging` can enable it for the same crate version.
+
+For builds within this repository:
+
+```sh
+cargo build --no-default-features
+cargo build --no-default-features --features logging
+```
 
 ## Methods
 At a high level, this project provided many consensus algorithms that slowly build upon each other from a baseline single-consensus method.

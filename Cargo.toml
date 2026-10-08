@@ -3,12 +3,32 @@ name = "waffle_con"
 version = "0.4.4"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+rust-version = "1.85.1"
+description = "Consensus sequence generation using dynamic wavefront alignment"
+repository = "https://github.com/PacificBiosciences/waffle_con"
+documentation = "https://docs.rs/waffle_con"
+readme = "README.md"
+license-file = "LICENSE.md"
+include = [
+    "/src/**",
+    "/tests/**",
+    "/benches/**",
+    "/examples/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE.md",
+]
+
+[features]
+default = ["logging"]
+logging = ["dep:log"]
 
 [dependencies]
 derive_builder = "0.13.0"
 itertools = "0.12.1"
-log = "0.4.20"
+log = { version = "0.4.20", optional = true }
 rustc-hash = "1.1.0"
 simple-error = "0.3.0"
 rand = "0.8.5"

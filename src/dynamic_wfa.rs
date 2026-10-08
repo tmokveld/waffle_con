@@ -187,7 +187,7 @@ impl DWFALite {
                         // not equal 
                         baseline_seq[baseline_offset] != other_seq[other_offset] && 
                         // AND baseline is not the configured wildcard
-                        !self.config.wildcard.is_some_and(|wildcard| baseline_seq[baseline_offset] == wildcard)
+                        self.config.wildcard.is_none_or(|wildcard| baseline_seq[baseline_offset] != wildcard)
                     ) {
                     // if we are past the end of either sequence OR
                     // the sequences are not equal at this position THEN

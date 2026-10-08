@@ -3,12 +3,18 @@ on: [push, pull_request]
 
 jobs:
   test:
-    name: cargo test
+    name: cargo test (${{ matrix.toolchain }}, ${{ matrix.features }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.85.1"]
+        features: ["--all-features", "--no-default-features"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.toolchain }}
           components: clippy
-      - run: RUST_LOG=trace cargo test --all-features --release
-      - run: cargo clippy -- -D warnings
+      - run: RUST_LOG=trace cargo test ${{ matrix.features }} --release
+      - run: cargo clippy ${{ matrix.features }} -- -D warnings
