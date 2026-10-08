@@ -3,6 +3,9 @@
 * Integrate upstream's binary-heap consensus queues and dual-consensus benchmarks.
 * Remove the superseded queue hashing and cached consensus-prefix fingerprints.
 * Retain reusable candidate storage, allocation-free total-cost calculation, in-place wavefront growth, and maximum-reach tracking during extension.
+* Enqueue consensus children directly and move the parent into the last child, avoiding a temporary child vector and one deep clone per branch.
+* Cache exact baseline and other-coordinate maxima while preserving DWFA equality, hashing, offsets, caps, and finalization semantics.
+* Extend generated-read benchmarks with 10 kb single-consensus reads and a branching fixture. On Apple arm64 with Rust 1.85.1/default-feature release LTO, the retained ownership-plus-maxima variant improved the 1 kb/30-read/1% and branching cases by 10.0% and 16.7%, respectively (median of three paired ratios), with no regression above 3% across 15 single and 12 dual cases. Rightmost-interval scanning was evaluated but not retained because seven full-matrix rows exceeded that guard; CNBP was excluded.
 
 ## Features
 * Add optional absolute and fractional per-read edit-distance caps with an optional minimum cap. Reads exceeding a cap stop voting and expose an explicit exclusion assignment; caps remain disabled by default.

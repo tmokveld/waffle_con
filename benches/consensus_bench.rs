@@ -8,7 +8,7 @@ use waffle_con::example_gen::{generate_dual_test, generate_test};
 
 pub fn bench_consensus(c: &mut Criterion) {
     let alphabet_size = 4;
-    let seq_lens = [50, 200, 1000];
+    let seq_lens = [50, 200, 1000, 10_000];
     let num_samples = [10, 30];
     let error_rates = [0.0, 0.01];
 
@@ -17,6 +17,9 @@ pub fn bench_consensus(c: &mut Criterion) {
 
     for &sl in seq_lens.iter() {
         for &ns in num_samples.iter() {
+            if sl == 10_000 && ns == 30 {
+                continue;
+            }
             // require 25% of reads to go forth
             let config = CdwfaConfigBuilder::default()
                 .min_count((ns as u64) / 4)
@@ -48,6 +51,20 @@ pub fn bench_consensus(c: &mut Criterion) {
             }
         }
     }
+
+    let config = CdwfaConfigBuilder::default()
+        .min_count(2)
+        .build().unwrap();
+    let (_, _, dataset) = generate_dual_test(4, 200, 5, 0.01, 4);
+    benchmark_group.bench_function("consensus_branch_4x200x10_0.01_diff4", |b| b.iter(|| {
+        black_box({
+            let mut consensus_dwfa = ConsensusDWFA::with_config(config.clone()).unwrap();
+            for s in dataset.iter() {
+                consensus_dwfa.add_sequence(s).unwrap();
+            }
+            consensus_dwfa.consensus().unwrap()
+        });
+    }));
 
     benchmark_group.finish();
 }

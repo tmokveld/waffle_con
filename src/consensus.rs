@@ -353,44 +353,32 @@ impl<'a> ConsensusDWFA<'a> {
                     }
                 }).collect();
             
-            let mut new_nodes = vec![];
-            if passing_candidates.is_empty() {
-                if top_len < max_activate {
-                    bail!("Encountered coverage gap: consensus is length {} with no candidates, but sequences activate at {}", top_len, max_activate);
-                } else {
-                    // no extensions remain, should just happen at the end
-                }
-            } else if passing_candidates.len() == 1 {
-                // we have only one extension, we can extend in place without cloning
-                let mut new_node = top_node;
-                new_node.push(&self.sequences, passing_candidates[0])?;
-                new_nodes.push(new_node);
-            } else {
-                // we have 2+ viable, we have to clone them
-                for symbol in passing_candidates.into_iter() {
-                    let mut new_node = top_node.clone();
-                    new_node.push(&self.sequences, symbol)?;
-                    new_nodes.push(new_node);
-                }
-            }
-
-            // for each need node, do any activations and then add it to the queue
-            for mut new_node in new_nodes.into_iter() {
+            let mut enqueue_extension = |mut node: ConsensusNode, symbol: u8| -> Result<(), Box<dyn std::error::Error>> {
+                node.push(&self.sequences, symbol)?;
                 // check if we need to activate any strings
-                let opt_activate_list = activate_points.get(&new_node.consensus().len());
+                let opt_activate_list = activate_points.get(&node.consensus().len());
                 if let Some(activate_list) = opt_activate_list {
                     assert!(!activate_list.is_empty());
                     for &seq_index in activate_list.iter() {
-                        new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
+                        node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                     }
                 }
 
                 // get the new cost and put it in the queue
                 #[cfg(feature = "logging")]
-                trace!("\tPush {next_id} => {:?}", new_node.consensus);
-                pqueue_tracker.insert(new_node.consensus().len());
-                new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+                trace!("\tPush {next_id} => {:?}", node.consensus);
+                pqueue_tracker.insert(node.consensus().len());
+                node.enqueue(&mut pqueue, next_id, self.consensus_cost());
                 next_id += 1;
+                Ok(())
+            };
+            if let Some((&last_symbol, preceding_symbols)) = passing_candidates.split_last() {
+                for &symbol in preceding_symbols {
+                    enqueue_extension(top_node.clone(), symbol)?;
+                }
+                enqueue_extension(top_node, last_symbol)?;
+            } else if top_len < max_activate {
+                bail!("Encountered coverage gap: consensus is length {} with no candidates, but sequences activate at {}", top_len, max_activate);
             }
         }
 
@@ -714,6 +702,19 @@ mod tests {
     use super::*;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
+
+    #[test]
+    fn test_branch_children_remain_independent() {
+        let mut consensus_dwfa = ConsensusDWFA::default();
+        for read in [b"ACGTACGT", b"ACGTACGT", b"ACGTACGT", b"AGGTACGT", b"AGGTACGT", b"AGGTACGT"] {
+            consensus_dwfa.add_sequence(read).unwrap();
+        }
+        let results = consensus_dwfa.consensus().unwrap();
+        assert_eq!(results, vec![
+            Consensus::new(b"ACGTACGT".to_vec(), ConsensusCost::L1Distance, vec![0, 0, 0, 1, 1, 1], None).unwrap(),
+            Consensus::new(b"AGGTACGT".to_vec(), ConsensusCost::L1Distance, vec![1, 1, 1, 0, 0, 0], None).unwrap(),
+        ]);
+    }
 
     #[test]
     fn test_candidate_nomination_order_and_votes() {
