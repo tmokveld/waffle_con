@@ -27,7 +27,9 @@ impl CandidateScratch {
         for &symbol in &self.touched[..self.touched_len] {
             self.counts[symbol as usize] = 0;
         }
-        self.levels[self.level].clear();
+        if self.touched_len >= 2 {
+            self.levels[self.level].clear();
+        }
         self.touched_len = 0;
         self.level = 0;
     }
@@ -41,8 +43,15 @@ impl CandidateScratch {
 
         self.touched[self.touched_len] = symbol;
         self.touched_len += 1;
+        self.counts[index] = 1;
+        if self.touched_len == 1 {
+            return;
+        }
         if self.levels[self.level].capacity() == 0 {
             self.levels[self.level].reserve(1);
+        }
+        if self.touched_len == 2 {
+            self.levels[0].entry(self.touched[0]).or_insert(0);
         }
         if self.levels[self.level].len() == self.levels[self.level].capacity() {
             let next_level = self.level + 1;
@@ -60,13 +69,21 @@ impl CandidateScratch {
             self.level = next_level;
         }
         self.levels[self.level].entry(symbol).or_insert(0);
-        self.counts[index] = 1;
     }
 
     pub(crate) fn ordered_counts(&self) -> impl Iterator<Item = (u8, usize)> + '_ {
-        self.levels[self.level]
-            .keys()
-            .map(|&symbol| (symbol, self.counts[symbol as usize]))
+        let singleton = (self.touched_len == 1)
+            .then(|| (self.touched[0], self.counts[self.touched[0] as usize]));
+        singleton.into_iter().chain(
+            self.levels[self.level]
+                .keys()
+                .map(|&symbol| (symbol, self.counts[symbol as usize])),
+        )
+    }
+
+    /// First-seen membership, not fresh-map traversal order.
+    pub(crate) fn distinct_symbols(&self) -> &[u8] {
+        &self.touched[..self.touched_len]
     }
 }
 
@@ -77,12 +94,16 @@ mod tests {
     fn compare_stream(scratch: &mut CandidateScratch, stream: &[u8]) {
         scratch.reset();
         let mut fresh = FxHashMap::<u8, usize>::default();
-        assert!(scratch.ordered_counts().eq(fresh.iter().map(|(&b, &n)| (b, n))));
+        assert!(scratch
+            .ordered_counts()
+            .eq(fresh.iter().map(|(&b, &n)| (b, n))));
         for &symbol in stream {
             *fresh.entry(symbol).or_insert(0) += 1;
             scratch.record(symbol);
-            assert_eq!(scratch.ordered_counts().collect::<Vec<_>>(),
-                fresh.iter().map(|(&b, &n)| (b, n)).collect::<Vec<_>>());
+            assert_eq!(
+                scratch.ordered_counts().collect::<Vec<_>>(),
+                fresh.iter().map(|(&b, &n)| (b, n)).collect::<Vec<_>>()
+            );
         }
     }
 
@@ -91,10 +112,14 @@ mod tests {
         let mut scratch = CandidateScratch::default();
         for reverse in [false, true] {
             let mut bytes: Vec<u8> = (0..=255).collect();
-            if reverse { bytes.reverse(); }
+            if reverse {
+                bytes.reverse();
+            }
             let mut stream = Vec::new();
             for &symbol in &bytes {
-                if let Some(&previous) = stream.last() { stream.push(previous); }
+                if let Some(&previous) = stream.last() {
+                    stream.push(previous);
+                }
                 stream.extend_from_slice(&[symbol, symbol]);
             }
             compare_stream(&mut scratch, &stream);
@@ -104,11 +129,52 @@ mod tests {
     #[test]
     fn test_large_small_empty_reset_order() {
         let mut scratch = CandidateScratch::default();
-        let full: Vec<u8> = (0..=255).flat_map(|b| std::iter::repeat(b).take(1 + b as usize % 5)).collect();
-        let streams = [vec![], vec![255,255], full, vec![0,255,0], vec![], vec![0,4,8,255,4]];
+        let full: Vec<u8> = (0..=255)
+            .flat_map(|b| std::iter::repeat(b).take(1 + b as usize % 5))
+            .collect();
+        let streams = [
+            vec![],
+            vec![255, 255],
+            full,
+            vec![0, 255, 0],
+            vec![],
+            vec![0, 4, 8, 255, 4],
+        ];
         for _ in 0..3 {
-            for stream in &streams { compare_stream(&mut scratch, stream); }
-            for stream in streams.iter().rev() { compare_stream(&mut scratch, stream); }
+            for stream in &streams {
+                compare_stream(&mut scratch, stream);
+            }
+            for stream in streams.iter().rev() {
+                compare_stream(&mut scratch, stream);
+            }
+        }
+    }
+
+    #[test]
+    fn test_singleton_ambiguity_transitions_match_fresh_maps() {
+        let mut scratch = CandidateScratch::default();
+        let full: Vec<u8> = (0..=255)
+            .flat_map(|byte| std::iter::repeat(byte).take(1 + byte as usize % 5))
+            .collect();
+        let streams = [
+            vec![],
+            vec![0],
+            vec![0, 0, 0],
+            vec![0, 0, 255, 0, 255],
+            full,
+            vec![255, 255],
+            vec![],
+            vec![4, 4, 8, 4],
+            vec![4],
+            vec![],
+        ];
+        for _ in 0..3 {
+            for stream in &streams {
+                compare_stream(&mut scratch, stream);
+            }
+            for stream in streams.iter().rev() {
+                compare_stream(&mut scratch, stream);
+            }
         }
     }
 }

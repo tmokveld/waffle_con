@@ -671,12 +671,20 @@ impl ConsensusNode {
             if let Some(dwfa) = opt_dwfa.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit) {
                 // get the candidates and the total observation weight
                 dwfa.fill_extension_candidates(baseline_seq, &self.consensus, scratch);
-                let vote_split = scratch.ordered_counts().map(|(_, occ)| occ).sum::<usize>() as f64;
-                
-                // iterate over each candidate and scale it by the occurrences count / total weight
-                for (c, occ) in scratch.ordered_counts() {
-                    let entry = candidates.entry(c).or_insert(0.0);
-                    *entry += occ as f64 / vote_split;
+                match scratch.distinct_symbols() {
+                    [] => continue,
+                    [symbol] => {
+                        *candidates.entry(*symbol).or_insert(0.0) += 1.0;
+                    }
+                    _ => {
+                        let vote_split = scratch.ordered_counts().map(|(_, occ)| occ).sum::<usize>() as f64;
+
+                        // iterate over each candidate and scale it by the occurrences count / total weight
+                        for (c, occ) in scratch.ordered_counts() {
+                            let entry = candidates.entry(c).or_insert(0.0);
+                            *entry += occ as f64 / vote_split;
+                        }
+                    }
                 }
             }
         }
@@ -738,7 +746,31 @@ mod tests {
         }
 
         let mut scratch = crate::candidate_scratch::CandidateScratch::default();
-        for wildcard in [None, Some(b'*'), Some(0), Some(255)] {
+        let reads: [&[u8]; 4] = [&[0,0,0], &[0,255], &[0,0,0], &[]];
+        let mut node = ConsensusNode::new_root_node(&reads, &[None; 4], &CdwfaConfig::default()).unwrap();
+        node.push(&reads, 42).unwrap();
+        assert_eq!(node.dwfas[0].as_ref().unwrap().get_extension_candidates(reads[0], &[42]),
+            HashMap::from_iter([(0, 2)]));
+        assert_eq!(node.dwfas[1].as_ref().unwrap().get_extension_candidates(reads[1], &[42]),
+            HashMap::from_iter([(0, 1), (255, 1)]));
+        assert!(node.dwfas[3].as_ref().unwrap().get_extension_candidates(reads[3], &[42]).is_empty());
+        let actual = node.get_extension_candidates(&reads, None, &mut scratch);
+        let expected: HashMap<u8, f64> = HashMap::from_iter([(0, 2.5), (255, 0.5)]);
+        assert_eq!(actual.iter().map(|(&byte, &vote)| (byte, vote.to_bits())).collect::<Vec<_>>(),
+            expected.iter().map(|(&byte, &vote)| (byte, vote.to_bits())).collect::<Vec<_>>());
+
+        for (owned, wildcard) in [
+            (vec![vec![255]; 3], None),
+            (vec![vec![42]; 3], Some(42)),
+            (vec![vec![42], vec![7]], Some(42)),
+            (vec![vec![]], None),
+        ] {
+            let reads: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            let config = CdwfaConfigBuilder::default().wildcard(wildcard).build().unwrap();
+            let node = ConsensusNode::new_root_node(&reads, &vec![None; reads.len()], &config).unwrap();
+            check(&node, &reads, wildcard, &mut scratch);
+        }
+        for wildcard in [None, Some(b'*'), Some(0), Some(42), Some(255)] {
             for early in [false, true] {
                 let alphabet: Vec<u8> = (0..=255).collect();
                 let cases = [
