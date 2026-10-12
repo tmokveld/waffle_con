@@ -11,12 +11,10 @@ Performance notes:
 * The underlying algorithm scales with WFA, so high error rates will increase compute time and memory consumption
 * Certain branching patterns are more expensive than others, we plan to improve this in the future
 
-# Cargo features
-The `logging` feature is enabled by default and emits diagnostics through the `log` facade.
-Applications choose and initialize their logger; this library does not initialize one.
-Set `default-features = false` on the dependency to remove logging calls, logging-only search statistics,
-and the normal `log` dependency without changing the consensus interface.
-Set `features = ["logging"]` to enable logging explicitly when default features are disabled.
+# Logging
+Diagnostics are emitted through the `log` facade.
+Applications choose and initialize their logger and control filtering at runtime; this library does not initialize one.
+Without an initialized logger, it produces no log output.
 
 # Example usage
 ```rust
