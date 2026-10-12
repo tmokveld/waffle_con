@@ -27,7 +27,6 @@ assert_eq!(consensuses[0].assignments(), None);
 ```
 */
 
-#[cfg(feature = "logging")]
 use log::{debug, trace};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use simple_error::{bail, SimpleError};
@@ -172,11 +171,8 @@ impl<'a> ConsensusDWFA<'a> {
     pub fn consensus(&self) -> Result<Vec<Consensus>, Box<dyn std::error::Error>> {
         // initialize everything
         let mut maximum_error = usize::MAX;
-        #[cfg(feature = "logging")]
         let mut nodes_explored: usize = 0;
-        #[cfg(feature = "logging")]
         let mut nodes_ignored: usize = 0;
-        #[cfg(feature = "logging")]
         let mut peak_queue_size: usize = 0;
         let mut farthest_consensus: usize = 0;
         let mut last_constraint: u64 = 0;
@@ -196,7 +192,6 @@ impl<'a> ConsensusDWFA<'a> {
             }
 
             if !start_sequence_found {
-                #[cfg(feature = "logging")]
                 debug!("No start sequence detected, shifting all offsets by {min_offset}");
                 self.offsets.iter()
                     .map(|o| {
@@ -217,7 +212,6 @@ impl<'a> ConsensusDWFA<'a> {
             self.offsets.clone()
         };
 
-        #[cfg(feature = "logging")]
         debug!("Offsets: {:?}", offsets);
 
         // build up the list of sizes where we need to activate one or more sequences
@@ -263,10 +257,7 @@ impl<'a> ConsensusDWFA<'a> {
         // the way this will work is that we will eventually find one or more answers and anything worse will get drained off until no possibilities remain
         while !pqueue.is_empty() {
             // this just tracks how large our actual queue gets
-            #[cfg(feature = "logging")]
-            {
-                peak_queue_size = peak_queue_size.max(pqueue.len());
-            }
+            peak_queue_size = peak_queue_size.max(pqueue.len());
 
             // first, check if we need to restrict our pqueue threshold
             while (pqueue_tracker.len() > max_queue_size || last_constraint >= self.config.max_nodes_wo_constraint) && pqueue_tracker.threshold() < farthest_consensus {
@@ -280,25 +271,17 @@ impl<'a> ConsensusDWFA<'a> {
             let top_len = top_node.consensus().len();
             pqueue_tracker.remove(top_len);
 
-            #[cfg(feature = "logging")]
             trace!("Pop: {:?} => {:?}", top_priority, top_node.consensus);
         
             if top_priority.0.0 > maximum_error || top_priority.1 < pqueue_tracker.threshold() || pqueue_tracker.at_capacity(top_len) {
-                #[cfg(feature = "logging")]
                 trace!("\tIgnored");
-                #[cfg(feature = "logging")]
-                {
-                    nodes_ignored += 1;
-                }
+                nodes_ignored += 1;
                 continue;
             }
 
             // mark this one as explored and updated farthest if necessary
             farthest_consensus = farthest_consensus.max(top_len);
-            #[cfg(feature = "logging")]
-            {
-                nodes_explored += 1;
-            }
+            nodes_explored += 1;
             last_constraint += 1;
             pqueue_tracker.process(top_len)?;
 
@@ -340,7 +323,6 @@ impl<'a> ConsensusDWFA<'a> {
             
             // the active threshold is the minimum of 1) the configured minimum count OR 2) the highest count we observed
             let active_threshold = (self.config.min_count as f64).min(max_observed);
-            #[cfg(feature = "logging")]
             trace!("\tcandidates = {:?}", extension_candidates);
 
             // pull out the full list of viable candidates
@@ -365,7 +347,6 @@ impl<'a> ConsensusDWFA<'a> {
                 }
 
                 // get the new cost and put it in the queue
-                #[cfg(feature = "logging")]
                 trace!("\tPush {next_id} => {:?}", node.consensus);
                 pqueue_tracker.insert(node.consensus().len());
                 node.enqueue(&mut pqueue, next_id, self.consensus_cost());
@@ -387,11 +368,8 @@ impl<'a> ConsensusDWFA<'a> {
         // sort these by the sequence so we always have a fixed order
         ret.sort_by(|c1, c2| c1.sequence().cmp(c2.sequence()));
 
-        #[cfg(feature = "logging")]
         debug!("nodes_explored: {nodes_explored}");
-        #[cfg(feature = "logging")]
         debug!("nodes_ignored: {nodes_ignored}");
-        #[cfg(feature = "logging")]
         debug!("peak_queue_size: {peak_queue_size}");
         Ok(ret)
     }

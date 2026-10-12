@@ -44,7 +44,6 @@ assert_eq!(consensuses[0].assignments(), &[
 ```
 */
 
-#[cfg(feature = "logging")]
 use log::{debug, trace, warn};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use simple_error::{bail, SimpleError};
@@ -278,11 +277,8 @@ impl<'a> DualConsensusDWFA<'a> {
     pub fn consensus(&self) -> Result<Vec<DualConsensus>, Box<dyn std::error::Error>> {
         // initialize everything
         let mut maximum_error = usize::MAX;
-        #[cfg(feature = "logging")]
         let mut nodes_explored: usize = 0;
-        #[cfg(feature = "logging")]
         let mut nodes_ignored: usize = 0;
-        #[cfg(feature = "logging")]
         let mut peak_queue_size: usize = 0;
         let mut farthest_consensus_single: usize = 0;
         let mut farthest_consensus_dual: usize = 0;
@@ -304,7 +300,6 @@ impl<'a> DualConsensusDWFA<'a> {
             }
 
             if !start_sequence_found {
-                #[cfg(feature = "logging")]
                 debug!("No start sequence detected, shifting all offsets by {min_offset}");
                 self.offsets.iter()
                     .map(|o| {
@@ -325,7 +320,6 @@ impl<'a> DualConsensusDWFA<'a> {
             self.offsets.clone()
         };
 
-        #[cfg(feature = "logging")]
         debug!("Offsets: {:?}", offsets);
         
         // build up the list of sizes where we need to activate one or more sequences
@@ -364,7 +358,6 @@ impl<'a> DualConsensusDWFA<'a> {
         next_id += 1;
 
         let mut ret: Vec<DualConsensus> = vec![];
-        #[cfg(feature = "logging")]
         let mut last_indiv = 0;
 
         // we need to do min_count based on the number of *active* sequences when we have really high coverage
@@ -382,14 +375,10 @@ impl<'a> DualConsensusDWFA<'a> {
         ];
 
         // the way this will work is that we will eventually find one or more answers and anything worse will get drained off until no possibilities remain
-        #[cfg(feature = "logging")]
         let mut iteration = 0;
         while !pqueue.is_empty() {
             // this just tracks how large our actual queue gets
-            #[cfg(feature = "logging")]
-            {
-                peak_queue_size = peak_queue_size.max(pqueue.len());
-            }
+            peak_queue_size = peak_queue_size.max(pqueue.len());
 
             // first, check if we need to restrict our pqueue threshold
             while (single_tracker.len() > max_queue_size || single_last_constraint >= self.config.max_nodes_wo_constraint) && single_tracker.threshold() < farthest_consensus_single {
@@ -407,7 +396,6 @@ impl<'a> DualConsensusDWFA<'a> {
             let top_len = top_node.max_consensus_length();
 
             let (threshold_cutoff, at_capacity) = if top_node.is_dual {
-                #[cfg(feature = "logging")]
                 trace!("{} -> \"{}\" + \"{}\", {:?}", 
                 top_cost.0.0,
                 top_node.consensus1.len(), 
@@ -416,7 +404,6 @@ impl<'a> DualConsensusDWFA<'a> {
                 dual_tracker.remove(top_len);
                 (dual_tracker.threshold(), dual_tracker.at_capacity(top_len))
             } else {
-                #[cfg(feature = "logging")]
                 trace!("{} -> \"{}\"", top_cost.0.0, top_node.consensus1.len());
                 single_tracker.remove(top_len);
                 (single_tracker.threshold(), single_tracker.at_capacity(top_len))
@@ -430,11 +417,7 @@ impl<'a> DualConsensusDWFA<'a> {
                 at_capacity ||
                 // if it's a dual node that is no longer containing enough on each group
                 top_node.is_dual_imbalanced(active_min_count[top_len] as usize) {
-                #[cfg(feature = "logging")]
-                {
-                    nodes_ignored += 1;
-                }
-                #[cfg(feature = "logging")]
+                nodes_ignored += 1;
                 trace!("\tignored {} || {} || {}", top_cost.0.0 > maximum_error, top_len < threshold_cutoff, top_node.is_dual_imbalanced(active_min_count[top_node.max_consensus_length()] as usize));
                 continue;
             }
@@ -449,46 +432,40 @@ impl<'a> DualConsensusDWFA<'a> {
                 single_last_constraint += 1;
                 single_tracker.process(top_len)?;
             }
-            #[cfg(feature = "logging")]
-            {
-                nodes_explored += 1;
+            nodes_explored += 1;
+
+            if !top_node.is_dual {
+                last_indiv = last_indiv.max(top_len);
             }
 
-            #[cfg(feature = "logging")]
-            {
-                if !top_node.is_dual {
-                    last_indiv = last_indiv.max(top_len);
-                }
+            if iteration % 1000 == 0 {
+                trace!("i: {}, t: {}, s: {}, d: {}", iteration, pqueue.len(), single_tracker.len(), dual_tracker.len());
+                trace!(
+                    "Handling: cost={}, dual={}, h1_len={}, h2_len={}; s_t: {}, d_t: {}",
+                    top_node.total_cost(self.config.consensus_cost),
+                    top_node.is_dual,
+                    top_node.consensus1.len(),
+                    top_node.consensus2.len(),
+                    single_tracker.threshold(),
+                    dual_tracker.threshold()
+                );
+            }
 
-                if iteration % 1000 == 0 {
-                    trace!("i: {}, t: {}, s: {}, d: {}", iteration, pqueue.len(), single_tracker.len(), dual_tracker.len());
-                    trace!(
-                        "Handling: cost={}, dual={}, h1_len={}, h2_len={}; s_t: {}, d_t: {}",
-                        top_node.total_cost(self.config.consensus_cost),
-                        top_node.is_dual,
-                        top_node.consensus1.len(),
-                        top_node.consensus2.len(),
-                        single_tracker.threshold(),
-                        dual_tracker.threshold()
-                    );
-                }
-
-                let l = 50.min(top_node.consensus1.len());
+            let l = 50.min(top_node.consensus1.len());
+            if l > 0 {
+                trace!("\t{:?}..{:?}",
+                    &top_node.consensus1[..l],
+                    &top_node.consensus1[(top_node.consensus1.len()-l)..]);
+            }
+            if top_node.is_dual {
+                let l = 50.min(top_node.consensus2.len());
                 if l > 0 {
                     trace!("\t{:?}..{:?}",
-                        &top_node.consensus1[..l],
-                        &top_node.consensus1[(top_node.consensus1.len()-l)..]);
+                        &top_node.consensus2[..l],
+                        &top_node.consensus2[(top_node.consensus2.len()-l)..]);
                 }
-                if top_node.is_dual {
-                    let l = 50.min(top_node.consensus2.len());
-                    if l > 0 {
-                        trace!("\t{:?}..{:?}",
-                            &top_node.consensus2[..l],
-                            &top_node.consensus2[(top_node.consensus2.len()-l)..]);
-                    }
-                }
-                iteration += 1;
             }
+            iteration += 1;
 
             // now check if this node has reached the end
             if top_node.reached_all_end(&self.sequences, self.config.allow_early_termination) {
@@ -520,7 +497,6 @@ impl<'a> DualConsensusDWFA<'a> {
                     if finalized_score < maximum_error {
                         // this score is better than anything we have seen so far, clear out previous results if we have any
                         maximum_error = finalized_score;
-                        #[cfg(feature = "logging")]
                         trace!("\tMaximum error set to {maximum_error}");
                         ret.clear();
                     }
@@ -532,11 +508,8 @@ impl<'a> DualConsensusDWFA<'a> {
                             &finalized_node,
                             self.config.consensus_cost
                         )?;
-                        #[cfg(feature = "logging")]
                         trace!("\tadding to ret");//: {dual_con_result:?}");
-                        #[cfg(feature = "logging")]
                         trace!("\tcon1: {:?}", dual_con_result.consensus1().sequence());
-                        #[cfg(feature = "logging")]
                         if let Some(c2) = dual_con_result.consensus2() {
                             trace!("\tcon2: {:?}", c2.sequence());
                         } else {
@@ -547,7 +520,6 @@ impl<'a> DualConsensusDWFA<'a> {
                 } else {
                     // this node is not balanced correctly for us to return it as a solution
                     // note that it may still be a candidate for extension though
-                    #[cfg(feature = "logging")]
                     trace!("Finalized node is imbalanced, ignoring.");
                 }
             }
@@ -608,9 +580,7 @@ impl<'a> DualConsensusDWFA<'a> {
                 let is_con1_finalized = top_node.reached_consensus_end(&self.sequences, true, self.config.allow_early_termination);
                 let is_con2_finalized = top_node.reached_consensus_end(&self.sequences, false, self.config.allow_early_termination);
 
-                #[cfg(feature = "logging")]
                 trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
-                #[cfg(feature = "logging")]
                 trace!("\tec2: {extension_candidates2:?}, {active_threshold2}");
 
                 // now create adjust extension lists that can have None
@@ -673,7 +643,6 @@ impl<'a> DualConsensusDWFA<'a> {
                             continue;
                         }
 
-                        #[cfg(feature = "logging")]
                         trace!("\tExtending with: {opt_can1:?} + {opt_can2:?}");
 
                         // pair wise add each extension; above check enforces that at least one of these `if` statements are executed
@@ -715,7 +684,6 @@ impl<'a> DualConsensusDWFA<'a> {
             } else {
                 // this is currently a non-dual node
                 // first, handle the option where it stays as non-dual
-                #[cfg(feature = "logging")]
                 trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
                 for (&symbol, &count) in extension_candidates1.iter() {
                     if count < active_threshold1 {
@@ -835,7 +803,6 @@ impl<'a> DualConsensusDWFA<'a> {
         //     we remove all non-dual nodes, but then all the dual nodes fail the final check
         // assert!(!ret.is_empty());
         if ret.is_empty() {
-            #[cfg(feature = "logging")]
             warn!("No consensus found that reached end, is there a gap between input sequences?");
 
             // TODO: how do we want to handle this long-term? this returns an empty string consensus
@@ -844,13 +811,9 @@ impl<'a> DualConsensusDWFA<'a> {
             ret.push(DualConsensus::from_node(&root_node, self.consensus_cost())?);
         }
 
-        #[cfg(feature = "logging")]
         debug!("nodes_explored: {nodes_explored}");
-        #[cfg(feature = "logging")]
         debug!("nodes_ignored: {nodes_ignored}");
-        #[cfg(feature = "logging")]
         debug!("peak_queue_size: {peak_queue_size}");
-        #[cfg(feature = "logging")]
         debug!("last_indiv: {last_indiv}");
 
         Ok(ret)

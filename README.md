@@ -20,20 +20,17 @@ Rust 1.85.1 or newer is required.
 A user-friendly HTML version can be generated via `cargo doc`.
 
 ## Logging
-The `logging` Cargo feature is enabled by default. It sends diagnostics through the [`log` facade](https://docs.rs/log/);
-the application chooses and initializes its logger and controls filtering. This library does not initialize a logger.
+Diagnostics are emitted through the [`log` facade](https://docs.rs/log/).
+The application chooses and initializes its logger and controls filtering. This library does not initialize a logger.
 Without an initialized logger, it produces no log output.
 
-Set `default-features = false` on the `waffle_con` dependency to compile out its logging calls, logging-only search statistics,
-and normal `log` dependency. All consensus functionality remains available. To enable logging explicitly while leaving
-other default features disabled, also set `features = ["logging"]`.
-Cargo features are additive: another dependency enabling `waffle_con/logging` can enable it for the same crate version.
+For example, with `env_logger` in your application, keep application logging at `Info` while suppressing this crate's diagnostics:
 
-For builds within this repository:
-
-```sh
-cargo build --no-default-features
-cargo build --no-default-features --features logging
+```rust
+env_logger::Builder::new()
+    .filter_level(log::LevelFilter::Info)
+    .filter_module("waffle_con", log::LevelFilter::Off)
+    .init();
 ```
 
 ## Methods
