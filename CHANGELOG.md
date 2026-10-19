@@ -5,6 +5,10 @@
 * Integrate upstream's binary-heap consensus queues and dual-consensus benchmarks.
 * Remove the superseded queue hashing and cached consensus-prefix fingerprints.
 * Retain reusable candidate storage, allocation-free total-cost calculation, in-place wavefront growth, and maximum-reach tracking during extension.
+* Enqueue consensus children directly and move the parent into the last child, avoiding a temporary child vector and one deep clone per branch.
+* Cache exact baseline and other-coordinate maxima while preserving DWFA equality, hashing, offsets, caps, and finalization semantics.
+* Cache extension frontiers for wavefronts at least 33 slots wide.
+* Skip ordering-map work for empty/singleton per-read nominations and normalize single-consensus singleton votes directly, preserving fresh-map order and dual vote arithmetic.
 
 ## Features
 
@@ -20,6 +24,7 @@
 
 * Preserve exact global endpoint scoring and finalization sealing while integrating edit-distance limits, including caps reached during finalization.
 * Make dual-consensus trace formatting byte-safe so enabling logging cannot panic or return UTF-8 conversion errors for non-UTF-8 sequences.
+
 
 # v0.4.4
 

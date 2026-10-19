@@ -335,43 +335,31 @@ impl<'a> ConsensusDWFA<'a> {
                     }
                 }).collect();
             
-            let mut new_nodes = vec![];
-            if passing_candidates.is_empty() {
-                if top_len < max_activate {
-                    bail!("Encountered coverage gap: consensus is length {} with no candidates, but sequences activate at {}", top_len, max_activate);
-                } else {
-                    // no extensions remain, should just happen at the end
-                }
-            } else if passing_candidates.len() == 1 {
-                // we have only one extension, we can extend in place without cloning
-                let mut new_node = top_node;
-                new_node.push(&self.sequences, passing_candidates[0])?;
-                new_nodes.push(new_node);
-            } else {
-                // we have 2+ viable, we have to clone them
-                for symbol in passing_candidates.into_iter() {
-                    let mut new_node = top_node.clone();
-                    new_node.push(&self.sequences, symbol)?;
-                    new_nodes.push(new_node);
-                }
-            }
-
-            // for each need node, do any activations and then add it to the queue
-            for mut new_node in new_nodes.into_iter() {
+            let mut enqueue_extension = |mut node: ConsensusNode, symbol: u8| -> Result<(), Box<dyn std::error::Error>> {
+                node.push(&self.sequences, symbol)?;
                 // check if we need to activate any strings
-                let opt_activate_list = activate_points.get(&new_node.consensus().len());
+                let opt_activate_list = activate_points.get(&node.consensus().len());
                 if let Some(activate_list) = opt_activate_list {
                     assert!(!activate_list.is_empty());
                     for &seq_index in activate_list.iter() {
-                        new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
+                        node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                     }
                 }
 
                 // get the new cost and put it in the queue
-                trace!("\tPush {next_id} => {:?}", new_node.consensus);
-                pqueue_tracker.insert(new_node.consensus().len());
-                new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+                trace!("\tPush {next_id} => {:?}", node.consensus);
+                pqueue_tracker.insert(node.consensus().len());
+                node.enqueue(&mut pqueue, next_id, self.consensus_cost());
                 next_id += 1;
+                Ok(())
+            };
+            if let Some((&last_symbol, preceding_symbols)) = passing_candidates.split_last() {
+                for &symbol in preceding_symbols {
+                    enqueue_extension(top_node.clone(), symbol)?;
+                }
+                enqueue_extension(top_node, last_symbol)?;
+            } else if top_len < max_activate {
+                bail!("Encountered coverage gap: consensus is length {} with no candidates, but sequences activate at {}", top_len, max_activate);
             }
         }
 
@@ -661,12 +649,20 @@ impl ConsensusNode {
             if let Some(dwfa) = opt_dwfa.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit) {
                 // get the candidates and the total observation weight
                 dwfa.fill_extension_candidates(baseline_seq, &self.consensus, scratch);
-                let vote_split = scratch.ordered_counts().map(|(_, occ)| occ).sum::<usize>() as f64;
-                
-                // iterate over each candidate and scale it by the occurrences count / total weight
-                for (c, occ) in scratch.ordered_counts() {
-                    let entry = candidates.entry(c).or_insert(0.0);
-                    *entry += occ as f64 / vote_split;
+                match scratch.distinct_symbols() {
+                    [] => continue,
+                    [symbol] => {
+                        *candidates.entry(*symbol).or_insert(0.0) += 1.0;
+                    }
+                    _ => {
+                        let vote_split = scratch.ordered_counts().map(|(_, occ)| occ).sum::<usize>() as f64;
+
+                        // iterate over each candidate and scale it by the occurrences count / total weight
+                        for (c, occ) in scratch.ordered_counts() {
+                            let entry = candidates.entry(c).or_insert(0.0);
+                            *entry += occ as f64 / vote_split;
+                        }
+                    }
                 }
             }
         }
@@ -694,6 +690,19 @@ mod tests {
     use crate::cdwfa_config::CdwfaConfigBuilder;
 
     #[test]
+    fn test_branch_children_remain_independent() {
+        let mut consensus_dwfa = ConsensusDWFA::default();
+        for read in [b"ACGTACGT", b"ACGTACGT", b"ACGTACGT", b"AGGTACGT", b"AGGTACGT", b"AGGTACGT"] {
+            consensus_dwfa.add_sequence(read).unwrap();
+        }
+        let results = consensus_dwfa.consensus().unwrap();
+        assert_eq!(results, vec![
+            Consensus::new(b"ACGTACGT".to_vec(), ConsensusCost::L1Distance, vec![0, 0, 0, 1, 1, 1], None).unwrap(),
+            Consensus::new(b"AGGTACGT".to_vec(), ConsensusCost::L1Distance, vec![1, 1, 1, 0, 0, 0], None).unwrap(),
+        ]);
+    }
+
+    #[test]
     fn test_candidate_nomination_order_and_votes() {
         fn check(node: &ConsensusNode, reads: &[&[u8]], wildcard: Option<u8>, scratch: &mut crate::candidate_scratch::CandidateScratch) {
             let mut expected: HashMap<u8, f64> = Default::default();
@@ -715,7 +724,31 @@ mod tests {
         }
 
         let mut scratch = crate::candidate_scratch::CandidateScratch::default();
-        for wildcard in [None, Some(b'*'), Some(0), Some(255)] {
+        let reads: [&[u8]; 4] = [&[0,0,0], &[0,255], &[0,0,0], &[]];
+        let mut node = ConsensusNode::new_root_node(&reads, &[None; 4], &CdwfaConfig::default()).unwrap();
+        node.push(&reads, 42).unwrap();
+        assert_eq!(node.dwfas[0].as_ref().unwrap().get_extension_candidates(reads[0], &[42]),
+            HashMap::from_iter([(0, 2)]));
+        assert_eq!(node.dwfas[1].as_ref().unwrap().get_extension_candidates(reads[1], &[42]),
+            HashMap::from_iter([(0, 1), (255, 1)]));
+        assert!(node.dwfas[3].as_ref().unwrap().get_extension_candidates(reads[3], &[42]).is_empty());
+        let actual = node.get_extension_candidates(&reads, None, &mut scratch);
+        let expected: HashMap<u8, f64> = HashMap::from_iter([(0, 2.5), (255, 0.5)]);
+        assert_eq!(actual.iter().map(|(&byte, &vote)| (byte, vote.to_bits())).collect::<Vec<_>>(),
+            expected.iter().map(|(&byte, &vote)| (byte, vote.to_bits())).collect::<Vec<_>>());
+
+        for (owned, wildcard) in [
+            (vec![vec![255]; 3], None),
+            (vec![vec![42]; 3], Some(42)),
+            (vec![vec![42], vec![7]], Some(42)),
+            (vec![vec![]], None),
+        ] {
+            let reads: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            let config = CdwfaConfigBuilder::default().wildcard(wildcard).build().unwrap();
+            let node = ConsensusNode::new_root_node(&reads, &vec![None; reads.len()], &config).unwrap();
+            check(&node, &reads, wildcard, &mut scratch);
+        }
+        for wildcard in [None, Some(b'*'), Some(0), Some(42), Some(255)] {
             for early in [false, true] {
                 let alphabet: Vec<u8> = (0..=255).collect();
                 let cases = [
@@ -743,6 +776,19 @@ mod tests {
                         check(&node, &reads, wildcard, &mut scratch);
                     }
                 }
+            }
+        }
+
+        // Reuse per-read scratch across growth boundaries, duplicate reads,
+        // wildcard removal, and large -> small -> empty nomination sets.
+        for size in [256, 3, 0, 4, 7, 8, 14, 15, 28, 29, 56, 57, 112, 113, 224, 225, 256, 1, 0] {
+            let mut owned: Vec<Vec<u8>> = (0..size).flat_map(|b| [vec![b as u8], vec![b as u8]]).collect();
+            if owned.is_empty() { owned.push(vec![]); }
+            let reads: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            for wildcard in [None, Some(0), Some(255)] {
+                let config = CdwfaConfigBuilder::default().wildcard(wildcard).build().unwrap();
+                let node = ConsensusNode::new_root_node(&reads, &vec![None; reads.len()], &config).unwrap();
+                check(&node, &reads, wildcard, &mut scratch);
             }
         }
     }
