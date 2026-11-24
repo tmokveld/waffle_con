@@ -45,6 +45,7 @@ pub mod dual_consensus;
 pub mod dynamic_wfa;
 /// Utility for generating examples
 pub mod example_gen;
+mod global_scores;
 /// Main functionality for a multiple-consensus component
 pub mod multi_consensus;
 /// Recycles search nodes, so that clones can reuse their buffers

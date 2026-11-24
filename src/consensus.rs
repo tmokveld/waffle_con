@@ -34,6 +34,7 @@ use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::dynamic_wfa::{DWFALite, DWFALiteState, ExtensionVotes, VoteScratch};
+use crate::global_scores::{Columns, Patterns};
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
 
@@ -169,8 +170,80 @@ impl<'a> ConsensusDWFA<'a> {
     /// # Errors
     /// * if the DWFA throws errors
     pub fn consensus(&self) -> Result<Vec<Consensus>, Box<dyn std::error::Error>> {
+        self.consensus_search(
+            (),
+            |_, _| {},
+            |node, results| {
+                // Finalize a clone so the original wavefronts remain available for extension.
+                let mut finalized_node = (*node).clone();
+                finalized_node.finalize(&self.sequences)?;
+                let cost = self.config.consensus_cost;
+                let score = finalized_node.total_cost(cost);
+                results.retain(score, self.config.max_return_size, || {
+                    let scores = finalized_node.costs(cost);
+                    let assignments = finalized_node.assignments();
+                    Consensus::new(finalized_node.consensus, cost, scores, assignments)
+                })
+            },
+        )
+    }
+
+    /// Like [`Self::consensus`], but scores terminals with incremental global edit distances.
+    ///
+    /// This updates a score column for every read on every extension, even if that branch
+    /// is later pruned. Prefer it when finishing wavefronts at many possible endpoints
+    /// dominates the search; otherwise [`Self::consensus`] avoids that per-extension work.
+    ///
+    /// The DWFA still decides which prefixes to extend and score. The incremental scorer
+    /// supports L1 scoring without offsets, a wildcard, early termination, or edit-distance
+    /// cap settings. Other configurations use [`Self::consensus`] directly.
+    ///
+    /// # Errors
+    /// * if the DWFA throws errors
+    pub fn consensus_with_global_scores(&self) -> Result<Vec<Consensus>, Box<dyn std::error::Error>> {
+        let config = &self.config;
+        if config.consensus_cost != ConsensusCost::L1Distance
+            || config.wildcard.is_some()
+            || config.allow_early_termination
+            || config.max_edit_distance.is_some()
+            || config.max_edit_distance_fraction.is_some()
+            || config.min_edit_distance.is_some()
+            || self.offsets.iter().any(Option::is_some)
+        {
+            return self.consensus();
+        }
+
+        let patterns = Patterns::new(&self.sequences, &self.alphabet);
+        self.consensus_search(
+            Columns::root(&patterns),
+            |scores, symbol| scores.push(&patterns, symbol),
+            |node, results| {
+                let scores = node.terminal_scores.distances();
+                results.retain(scores.iter().sum(), config.max_return_size, || {
+                    Consensus::new(
+                        node.consensus().to_vec(),
+                        ConsensusCost::L1Distance,
+                        scores.to_vec(),
+                        None,
+                    )
+                })
+            },
+        )
+    }
+
+    // Specialize the same search for both scorers. The legacy state and append callback
+    // are zero-sized; no per-node score storage or dynamic dispatch is needed on that path.
+    fn consensus_search<S: Clone>(
+        &self,
+        terminal_scores: S,
+        append_score_column: impl Fn(&mut S, u8),
+        consider_terminal: impl Fn(
+            &ConsensusNode<S>,
+            &mut TerminalResults,
+        ) -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<Vec<Consensus>, Box<dyn std::error::Error>> {
         // initialize everything
-        let mut maximum_error = usize::MAX;
+        let mut results = TerminalResults { maximum_error: usize::MAX, retained: vec![] };
         let mut nodes_explored: usize = 0;
         let mut nodes_ignored: usize = 0;
         let mut peak_queue_size: usize = 0;
@@ -249,14 +322,14 @@ impl<'a> ConsensusDWFA<'a> {
             scratch: VoteScratch::default(),
         };
 
-        let initial_node = ConsensusNode::new_root_node(&self.sequences, &offsets, &self.config, &mut step_context)?;
+        let initial_node = ConsensusNode::new_root_node(
+            &self.sequences, &offsets, &self.config, &mut step_context, terminal_scores,
+        )?;
 
         // Max-heap ordered by queued priority: lower cost, then longer consensus, then earlier tie-breaker.
         let mut pqueue = PriorityQueue::new(self.consensus_cost());
         pqueue_tracker.insert(initial_node.consensus().len());
         pqueue.push(initial_node);
-
-        let mut ret = vec![];
 
         // buffers that each search step reuses
         let mut extension_candidates: Vec<(u8, f64)> = vec![];
@@ -281,7 +354,7 @@ impl<'a> ConsensusDWFA<'a> {
 
             trace!("Pop: {:?} => {:?}", top_priority, top_node.consensus);
         
-            if top_priority.0.0 > maximum_error || top_priority.1 < pqueue_tracker.threshold() || pqueue_tracker.at_capacity(top_len) {
+            if top_priority.0.0 > results.maximum_error || top_priority.1 < pqueue_tracker.threshold() || pqueue_tracker.at_capacity(top_len) {
                 trace!("\tIgnored");
                 nodes_ignored += 1;
                 continue;
@@ -295,31 +368,7 @@ impl<'a> ConsensusDWFA<'a> {
 
             // now check if this node has reached the end
             if top_node.summary.reached_end {
-                // this node *might* be done, we need to finalize it to be sure
-                // we also need to do it in a clone since it might not be finalized and we need to keep extending
-                let mut finalized_node = top_node.clone();
-                finalized_node.finalize(&self.sequences)?;
-
-                // get the new finalized score, it may have changed
-                let finalized_score = finalized_node.total_cost(self.config.consensus_cost);
-
-                // check first if it's stricly BETTER than anything so far
-                if finalized_score < maximum_error {
-                    // this score is better than anything we have seen so far, clear out previous results if we have any
-                    maximum_error = finalized_score;
-                    ret.clear();
-                }
-
-                // now check if it's as good as anything so far; the above check will not nullify this one
-                if finalized_score <= maximum_error && ret.len() < self.config.max_return_size {
-                    // this consensus is at least as good as the best, so add it as a result
-                    ret.push(Consensus::new(
-                        finalized_node.consensus().to_vec(),
-                        self.config.consensus_cost,
-                        finalized_node.costs(self.config.consensus_cost),
-                        finalized_node.assignments(),
-                    )?);
-                }
+                consider_terminal(&top_node, &mut results)?;
             }
 
             // this fetches the list of options according to the WFA so far
@@ -356,7 +405,7 @@ impl<'a> ConsensusDWFA<'a> {
                 } else {
                     parent.as_ref().unwrap().clone()
                 };
-                new_node.push(&self.sequences, symbol, &mut step_context)?;
+                new_node.push(&self.sequences, symbol, &mut step_context, &append_score_column)?;
 
                 // check if we need to activate any strings
                 let opt_activate_list = activate_points.get(&new_node.consensus().len());
@@ -379,12 +428,12 @@ impl<'a> ConsensusDWFA<'a> {
         assert_eq!(pqueue_tracker.len(), 0);
 
         // sort these by the sequence so we always have a fixed order
-        ret.sort_by(|c1, c2| c1.sequence().cmp(c2.sequence()));
+        results.retained.sort_by(|c1, c2| c1.sequence().cmp(c2.sequence()));
 
         debug!("nodes_explored: {nodes_explored}");
         debug!("nodes_ignored: {nodes_ignored}");
         debug!("peak_queue_size: {peak_queue_size}");
-        Ok(ret)
+        Ok(results.retained)
     }
 
     // getters
@@ -398,6 +447,30 @@ impl<'a> ConsensusDWFA<'a> {
 
     pub fn alphabet(&self) -> &HashSet<u8> {
         &self.alphabet
+    }
+}
+
+/// The best terminal cost also bounds exploration using the DWFA prefix cost.
+struct TerminalResults {
+    maximum_error: usize,
+    retained: Vec<Consensus>,
+}
+
+impl TerminalResults {
+    fn retain(
+        &mut self,
+        score: usize,
+        max_return_size: usize,
+        build: impl FnOnce() -> Result<Consensus, SimpleError>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if score < self.maximum_error {
+            self.maximum_error = score;
+            self.retained.clear();
+        }
+        if score <= self.maximum_error && self.retained.len() < max_return_size {
+            self.retained.push(build()?);
+        }
+        Ok(())
     }
 }
 
@@ -462,7 +535,7 @@ impl StepContext {
 
 /// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
 #[derive(Clone, Debug)]
-struct ConsensusNode {
+struct ConsensusNode<S> {
     /// The consensus sequence so far
     consensus: Vec<u8>,
     /// The DWFAs that are tracked for each sequence; these are only None if they have not been activated yet due to an offset
@@ -471,27 +544,29 @@ struct ConsensusNode {
     queued_priority: NodePriority,
     /// What the next search step needs from `dwfas`. Set by `push()`, `new_root_node()`, and one `summarize()` after activation.
     summary: StepSummary,
+    /// Incremental terminal scores for this branch, or `()` for native WFA finalization.
+    terminal_scores: S,
 }
 
 // The following Eq and Ord implementations are specifically for the Binary Heap.
 // They should not be used for actual node comparison.
 
-impl PartialEq for ConsensusNode {
+impl<S> PartialEq for ConsensusNode<S> {
     fn eq(&self, other: &Self) -> bool {
         self.queued_priority == other.queued_priority
     }
 }
 
 // `PartialEq` only compares the priority, which is a total order
-impl Eq for ConsensusNode {}
+impl<S> Eq for ConsensusNode<S> {}
 
-impl PartialOrd for ConsensusNode {
+impl<S> PartialOrd for ConsensusNode<S> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ConsensusNode {
+impl<S> Ord for ConsensusNode<S> {
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap pops the greatest node. queued_priority already ranks a lower edit distance,
         // then a longer consensus, then an earlier tie-breaker.
@@ -499,17 +574,24 @@ impl Ord for ConsensusNode {
     }
 }
 
-impl ConsensusNode {
+impl<S> ConsensusNode<S> {
     /// Constructor for a new consensus search root node
     /// # Arguments
     /// * `sequences` - the baseline reads, parallel to `offsets`
     /// * `offsets` - a set of offsets into the sequences where the approximate starts are
     /// * `config` - consensus configuration
     /// * `context` - summary settings; the returned node is already summarized
+    /// * `terminal_scores` - terminal score state for the empty consensus
     /// # Errors
     /// * if DWFA construction fails
     /// * if `sequences` and `offsets` have different lengths
-    fn new_root_node(sequences: &[&[u8]], offsets: &[Option<usize>], config: &CdwfaConfig, context: &mut StepContext) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
+    fn new_root_node(
+        sequences: &[&[u8]],
+        offsets: &[Option<usize>],
+        config: &CdwfaConfig,
+        context: &mut StepContext,
+        terminal_scores: S,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if sequences.len() != offsets.len() {
             bail!("Sequence and offset counts must match.");
         }
@@ -530,11 +612,12 @@ impl ConsensusNode {
             bail!("Root consensus node has no initially active sequences.");
         }
 
-        let mut node = ConsensusNode {
+        let mut node = Self {
             consensus: vec![],
             dwfas,
             queued_priority: (Reverse(0), 0, Reverse(0)),
             summary: StepSummary::default(),
+            terminal_scores,
         };
         node.summarize(sequences, context);
         Ok(node)
@@ -589,15 +672,22 @@ impl ConsensusNode {
         Ok(())
     }
 
-    /// Adds a new symbol to the consensus, updates each active DWFA, and refreshes the summary.
+    /// Extends the consensus, active wavefronts, and terminal scores with the same symbol.
     /// A single next symbol returned by `update()` votes directly; otherwise the DWFA calls `vote()`.
     /// # Arguments
     /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * `symbol` - the symbol to extend each DWFA with
     /// * `context` - summary settings and vote scratch space
+    /// * `append_score_column` - advances the terminal scores for this branch
     /// # Errors
     /// * if any of the extensions fail
-    fn push(&mut self, baseline_sequences: &[&[u8]], symbol: u8, context: &mut StepContext) -> Result<(), Box<dyn std::error::Error>> {
+    fn push(
+        &mut self,
+        baseline_sequences: &[&[u8]],
+        symbol: u8,
+        context: &mut StepContext,
+        append_score_column: &impl Fn(&mut S, u8),
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // update the consensus
         self.consensus.push(symbol);
 
@@ -627,6 +717,7 @@ impl ConsensusNode {
         }
         self.summary.total_cost = total_cost;
         self.summary.reached_end = context.reached_end(any_at_end, all_at_end);
+        append_score_column(&mut self.terminal_scores, symbol);
         Ok(())
     }
 
@@ -663,6 +754,8 @@ impl ConsensusNode {
     fn finalize(&mut self, baseline_sequences: &[&[u8]]) -> Result<(), Box<dyn std::error::Error>> {
         for (&baseline, opt_dwfa) in baseline_sequences.iter().zip(self.dwfas.iter_mut()) {
             if let Some(dwfa) = opt_dwfa.as_mut() {
+                #[cfg(test)]
+                NATIVE_FINALIZATIONS.with(|count| count.set(count.get() + 1));
                 dwfa.finalize(baseline, &self.consensus)?;
             } else {
                 bail!("Finalize called on DWFA that was never initialized.");
@@ -743,7 +836,7 @@ impl ConsensusNode {
     }
 }
 
-impl CachePriority for ConsensusNode {
+impl<S> CachePriority for ConsensusNode<S> {
     /// Caches this node's search priority.
     /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
     fn cache_priority(&mut self, consensus_cost: ConsensusCost, tie_breaker: u64) {
@@ -758,11 +851,106 @@ impl CachePriority for ConsensusNode {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static NATIVE_FINALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BinaryHeap;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
+
+    fn with_native_finalization_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        NATIVE_FINALIZATIONS.with(|count| {
+            count.set(0);
+            (run(), count.get())
+        })
+    }
+
+    #[test]
+    fn test_global_scores_match_length_divergent_reads() {
+        let reads: [&[u8]; 4] = [b"ACGT", b"AC", b"A", b"ACG"];
+        let mut dwfa = ConsensusDWFA::default();
+        for read in reads {
+            dwfa.add_sequence(read).unwrap();
+        }
+
+        let (legacy, legacy_finalizations) =
+            with_native_finalization_count(|| dwfa.consensus().unwrap());
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[0].sequence(), b"AC");
+        assert_eq!(legacy[1].sequence(), b"ACG");
+        // The length-one, length-two, and length-three terminals each finalize four reads.
+        assert_eq!(legacy_finalizations, 12);
+
+        let (global, global_finalizations) =
+            with_native_finalization_count(|| dwfa.consensus_with_global_scores().unwrap());
+        assert_eq!(global, legacy);
+        assert_eq!(global_finalizations, 0);
+    }
+
+    #[test]
+    fn test_global_scores_match_an_empty_read_and_terminal_root() {
+        let mut dwfa = ConsensusDWFA::default();
+        dwfa.add_sequence(b"ACGT").unwrap();
+        dwfa.add_sequence(b"").unwrap();
+
+        let legacy = dwfa.consensus().unwrap();
+        assert_eq!(legacy[0].sequence(), b"");
+        assert_eq!(legacy[0].scores(), &[4, 0]);
+        assert_eq!(dwfa.consensus_with_global_scores().unwrap(), legacy);
+    }
+
+    #[test]
+    fn test_global_scores_preserve_tied_siblings_and_the_return_cap() {
+        let mut first = [b'A'; 65];
+        first[64] = 0xff;
+        let mut second = first;
+        second[64] = 0;
+        for max_return_size in [1, 2] {
+            let config = CdwfaConfigBuilder::default()
+                .max_return_size(max_return_size)
+                .build()
+                .unwrap();
+            let mut dwfa = ConsensusDWFA::with_config(config).unwrap();
+            dwfa.add_sequence(&first).unwrap();
+            dwfa.add_sequence(&second).unwrap();
+
+            let legacy = dwfa.consensus().unwrap();
+            assert_eq!(legacy.len(), max_return_size);
+            // The first queued branch wins a capped tie even though it sorts last.
+            assert_eq!(legacy.last().unwrap().sequence(), &first[..]);
+            assert_eq!(dwfa.consensus_with_global_scores().unwrap(), legacy);
+        }
+    }
+
+    #[test]
+    fn test_global_scores_fall_back_for_unsupported_configurations() {
+        let configs = [
+            CdwfaConfig { consensus_cost: ConsensusCost::L2Distance, ..Default::default() },
+            CdwfaConfig { wildcard: Some(b'T'), ..Default::default() },
+            CdwfaConfig { allow_early_termination: true, ..Default::default() },
+            CdwfaConfig { max_edit_distance: Some(3), ..Default::default() },
+            CdwfaConfig { max_edit_distance_fraction: Some(0.25), ..Default::default() },
+            CdwfaConfig { min_edit_distance: Some(3), ..Default::default() },
+        ];
+        for config in configs {
+            let mut dwfa = ConsensusDWFA::with_config(config.clone()).unwrap();
+            for read in [b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT", b"TTTTTTTTTTTT"] {
+                dwfa.add_sequence(read).unwrap();
+            }
+
+            let (legacy, legacy_finalizations) =
+                with_native_finalization_count(|| dwfa.consensus().unwrap());
+            let (global, global_finalizations) =
+                with_native_finalization_count(|| dwfa.consensus_with_global_scores().unwrap());
+            assert_eq!(global, legacy, "{config:?}");
+            assert!(legacy_finalizations > 0, "{config:?}");
+            assert_eq!(global_finalizations, legacy_finalizations, "{config:?}");
+        }
+    }
 
     /// Checks that a lower cost wins, and equal costs prefer an earlier tie-breaker.
     #[test]
@@ -775,9 +963,9 @@ mod tests {
             consensus_cost: config.consensus_cost,
             scratch: VoteScratch::default(),
         };
-        let mut earlier = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context).unwrap();
-        let mut later = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context).unwrap();
-        let mut cheaper = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context).unwrap();
+        let mut earlier = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context, ()).unwrap();
+        let mut later = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context, ()).unwrap();
+        let mut cheaper = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context, ()).unwrap();
         earlier.queued_priority = (Reverse(1), 0, Reverse(0));
         later.queued_priority = (Reverse(1), 0, Reverse(1));
         cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
@@ -1042,6 +1230,7 @@ mod tests {
         assert_eq!(consensus.len(), 1);
         assert_eq!(expected_consensus, consensus[0].sequence());
         assert_eq!(&[0, 0, 0], consensus[0].scores());
+        assert_eq!(consensus_dwfa.consensus_with_global_scores().unwrap(), consensus);
     }
 
     /// Checks that a start far past activation leaves a DWFA uninitialized and fails finalize.
@@ -1076,6 +1265,8 @@ mod tests {
         assert!(consensus_err.is_err());
         let error = consensus_err.err().unwrap();
         assert_eq!(error.to_string(), "Finalize called on DWFA that was never initialized.");
+        let global_error = consensus_dwfa.consensus_with_global_scores().unwrap_err();
+        assert_eq!(global_error.to_string(), error.to_string());
     }
 
     /// Checks that a hard edit-distance cap freezes an outlier and labels it in the result.
