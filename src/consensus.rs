@@ -198,16 +198,17 @@ impl<'a> ConsensusDWFA<'a> {
     /// updates scores for every read on every extension, even on branches later pruned.
     /// If unsure, use [`Self::consensus`] and compare both on representative inputs.
     ///
-    /// The DWFA still decides which prefixes to extend and score. The incremental scorer
-    /// supports L1 scoring without offsets, a wildcard, early termination, or edit-distance
-    /// cap settings. Other configurations use [`Self::consensus`] directly.
+    /// The DWFA still decides which prefixes to extend and score. L1 returns each read's
+    /// edit distance; L2 returns its square and minimizes the sum of those squares.
+    /// As in [`Self::consensus`], the scores and their sum must fit in `usize`.
+    /// Offsets, a wildcard, early termination, or any edit-distance cap setting cause
+    /// this method to call [`Self::consensus`] directly.
     ///
     /// # Errors
     /// * if the DWFA throws errors
     pub fn consensus_with_global_scores(&self) -> Result<Vec<Consensus>, Box<dyn std::error::Error>> {
         let config = &self.config;
-        if config.consensus_cost != ConsensusCost::L1Distance
-            || config.wildcard.is_some()
+        if config.wildcard.is_some()
             || config.allow_early_termination
             || config.max_edit_distance.is_some()
             || config.max_edit_distance_fraction.is_some()
@@ -218,21 +219,23 @@ impl<'a> ConsensusDWFA<'a> {
         }
 
         let patterns = Patterns::new(&self.sequences, &self.alphabet);
-        self.consensus_search(
-            Columns::root(&patterns),
-            |scores, symbol| scores.push(&patterns, symbol),
-            |node, results| {
+        let root = Columns::root(&patterns);
+        let append = |columns: &mut Columns, symbol| columns.push(&patterns, symbol);
+        // Choose the terminal scorer once. Both searches extend the same distance columns.
+        match config.consensus_cost {
+            ConsensusCost::L1Distance => self.consensus_search(root, append, |node, results| {
                 let scores = node.terminal_scores.distances();
                 results.retain(scores.iter().sum(), config.max_return_size, || {
-                    Consensus::new(
-                        node.consensus().to_vec(),
-                        ConsensusCost::L1Distance,
-                        scores.to_vec(),
-                        None,
-                    )
+                    Consensus::new(node.consensus().to_vec(), ConsensusCost::L1Distance, scores.to_vec(), None)
                 })
-            },
-        )
+            }),
+            ConsensusCost::L2Distance => self.consensus_search(root, append, |node, results| {
+                let squares = node.terminal_scores.distances().iter().map(|d| d.pow(2));
+                results.retain(squares.clone().sum(), config.max_return_size, || {
+                    Consensus::new(node.consensus().to_vec(), ConsensusCost::L2Distance, squares.collect(), None)
+                })
+            }),
+        }
     }
 
     // Specialize the same search for both scorers. The legacy state and append callback
@@ -896,6 +899,32 @@ mod tests {
     }
 
     #[test]
+    fn test_global_scores_distinguish_l1_and_l2_optima() {
+        let reads: [&[u8]; 5] = [b"A", b"A", b"A", b"AA", b"AAAAAA"];
+        // L1 favors the median length. L2 must replace that first terminal even at cap one.
+        for (consensus_cost, winner, scores) in [
+            (ConsensusCost::L1Distance, &b"A"[..], [0, 0, 0, 1, 5]),
+            (ConsensusCost::L2Distance, &b"AA"[..], [1, 1, 1, 0, 16]),
+        ] {
+            let config = CdwfaConfig { consensus_cost, max_return_size: 1, ..Default::default() };
+            let mut dwfa = ConsensusDWFA::with_config(config).unwrap();
+            for read in reads {
+                dwfa.add_sequence(read).unwrap();
+            }
+
+            let (native, native_finalizations) = with_native_finalization_count(|| dwfa.consensus().unwrap());
+            let (global, global_finalizations) =
+                with_native_finalization_count(|| dwfa.consensus_with_global_scores().unwrap());
+            assert_eq!(native, [Consensus {
+                sequence: winner.to_vec(), consensus_cost, scores: scores.to_vec(), assignments: None,
+            }]);
+            assert_eq!(global, native);
+            assert!(native_finalizations > 0);
+            assert_eq!(global_finalizations, 0);
+        }
+    }
+
+    #[test]
     fn test_global_scores_match_an_empty_read_and_terminal_root() {
         let mut dwfa = ConsensusDWFA::default();
         dwfa.add_sequence(b"ACGT").unwrap();
@@ -913,46 +942,48 @@ mod tests {
         first[64] = 0xff;
         let mut second = first;
         second[64] = 0;
-        for max_return_size in [1, 2] {
-            let config = CdwfaConfigBuilder::default()
-                .max_return_size(max_return_size)
-                .build()
-                .unwrap();
-            let mut dwfa = ConsensusDWFA::with_config(config).unwrap();
-            dwfa.add_sequence(&first).unwrap();
-            dwfa.add_sequence(&second).unwrap();
+        for consensus_cost in [ConsensusCost::L1Distance, ConsensusCost::L2Distance] {
+            for max_return_size in [0, 1, 2] {
+                let config = CdwfaConfig { consensus_cost, max_return_size, ..Default::default() };
+                let mut dwfa = ConsensusDWFA::with_config(config).unwrap();
+                dwfa.add_sequence(&first).unwrap();
+                dwfa.add_sequence(&second).unwrap();
 
-            let legacy = dwfa.consensus().unwrap();
-            assert_eq!(legacy.len(), max_return_size);
-            // The first queued branch wins a capped tie even though it sorts last.
-            assert_eq!(legacy.last().unwrap().sequence(), &first[..]);
-            assert_eq!(dwfa.consensus_with_global_scores().unwrap(), legacy);
+                let native = dwfa.consensus().unwrap();
+                assert_eq!(native.len(), max_return_size);
+                if let Some(last) = native.last() {
+                    // The first queued branch wins a capped tie even though it sorts last.
+                    assert_eq!(last.sequence(), &first[..]);
+                }
+                assert_eq!(dwfa.consensus_with_global_scores().unwrap(), native);
+            }
         }
     }
 
     #[test]
     fn test_global_scores_fall_back_for_unsupported_configurations() {
-        let configs = [
-            CdwfaConfig { consensus_cost: ConsensusCost::L2Distance, ..Default::default() },
-            CdwfaConfig { wildcard: Some(b'T'), ..Default::default() },
-            CdwfaConfig { allow_early_termination: true, ..Default::default() },
-            CdwfaConfig { max_edit_distance: Some(3), ..Default::default() },
-            CdwfaConfig { max_edit_distance_fraction: Some(0.25), ..Default::default() },
-            CdwfaConfig { min_edit_distance: Some(3), ..Default::default() },
-        ];
-        for config in configs {
-            let mut dwfa = ConsensusDWFA::with_config(config.clone()).unwrap();
-            for read in [b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT", b"TTTTTTTTTTTT"] {
-                dwfa.add_sequence(read).unwrap();
-            }
+        for consensus_cost in [ConsensusCost::L1Distance, ConsensusCost::L2Distance] {
+            let base = CdwfaConfig { consensus_cost, ..Default::default() };
+            for (config, offset) in [
+                (CdwfaConfig { wildcard: Some(b'T'), ..base }, None),
+                (CdwfaConfig { allow_early_termination: true, ..base }, None),
+                (CdwfaConfig { max_edit_distance: Some(3), ..base }, None),
+                (CdwfaConfig { max_edit_distance_fraction: Some(0.25), ..base }, None),
+                (CdwfaConfig { min_edit_distance: Some(3), ..base }, None),
+                (base, Some(0)),
+            ] {
+                let mut dwfa = ConsensusDWFA::with_config(config).unwrap();
+                for read in [b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTACGTACGT", b"TTTTTTTTTTTT"] {
+                    dwfa.add_sequence_offset(read, offset).unwrap();
+                }
 
-            let (legacy, legacy_finalizations) =
-                with_native_finalization_count(|| dwfa.consensus().unwrap());
-            let (global, global_finalizations) =
-                with_native_finalization_count(|| dwfa.consensus_with_global_scores().unwrap());
-            assert_eq!(global, legacy, "{config:?}");
-            assert!(legacy_finalizations > 0, "{config:?}");
-            assert_eq!(global_finalizations, legacy_finalizations, "{config:?}");
+                let (native, native_finalizations) = with_native_finalization_count(|| dwfa.consensus().unwrap());
+                let (global, global_finalizations) =
+                    with_native_finalization_count(|| dwfa.consensus_with_global_scores().unwrap());
+                assert_eq!(global, native, "{:?}, offset {offset:?}", dwfa.config);
+                assert!(native_finalizations > 0);
+                assert_eq!(global_finalizations, native_finalizations, "{:?}, offset {offset:?}", dwfa.config);
+            }
         }
     }
 

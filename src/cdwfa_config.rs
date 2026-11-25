@@ -16,14 +16,13 @@ use simple_error::bail;
 
 use crate::dynamic_wfa::DWFALiteConfig;
 
-/// Enumeration of difference scoring types for a consensus.
-/// Initially just using L1 distance, which is the sum of edit distance across all inputs.
+/// How per-read edit distances contribute to the consensus score.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum ConsensusCost {
     /// Minimizes the total edit distance across all sequences
     #[default]
     L1Distance,
-    /// Minimizes the square of the edit distance across all sequences
+    /// Minimizes the sum of the squared per-read edit distances
     L2Distance
 }
 

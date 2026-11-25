@@ -37,11 +37,11 @@ Finally, priority consensus is just multi-consensus on a chain of sequence input
 
 ### Choosing a single-consensus scorer
 
-**Use `ConsensusDWFA::consensus()` by default.** Try `consensus_with_global_scores()` for uncapped L1 searches on long reads with a wide range of lengths. Both methods return the same ordered results. The difference is when they pay for scoring: `consensus()` finishes alignments at candidate endpoints, while the incremental method updates scores on every prefix extension, even on branches later discarded.
+**Use `ConsensusDWFA::consensus()` by default.** Try `consensus_with_global_scores()` for uncapped L1 or L2 searches on long reads with a wide range of lengths. Both methods return the same ordered results for the chosen objective. The difference is when they pay for scoring: `consensus()` finishes alignments at candidate endpoints, while the incremental method updates scores on every prefix extension, even on branches later discarded.
 
-Use the length spread (longest input minus shortest) as a reason to benchmark, not as a cutoff. Even at a 5,886 bp spread, native scoring was faster on uninterrupted repeats, while incremental scoring won at the same lengths with 0.1% substitutions. Time both calls on representative inputs before switching.
+Use the length spread (longest input minus shortest) as a reason to benchmark, not as a cutoff. In an L1 benchmark at a 5,886 bp spread, native scoring was faster on uninterrupted repeats, while incremental scoring won at the same lengths with 0.1% substitutions. Time both calls on representative inputs with your chosen objective before switching.
 
-If you use L2, read offsets, a wildcard, early termination, or any edit-distance cap setting (including a floor), call `consensus()` directly. The incremental method falls back to it for those configurations.
+If you use read offsets, a wildcard, early termination, or any edit-distance cap setting (including a floor), call `consensus()` directly. The incremental method falls back to it for those configurations.
 
 ## Limitations
 `waffle_con` has been designed for the specific purpose of PGx consensus in StarPhase using long, accurate HiFi reads.
