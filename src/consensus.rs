@@ -166,7 +166,9 @@ impl<'a> ConsensusDWFA<'a> {
         Ok(())
     }
 
-    /// The core function that gets called after adding all the sequences we care about
+    /// Computes single-consensus results using native wavefront scoring. Use this by default.
+    /// For long reads with widely varying lengths, see [`Self::consensus_with_global_scores`].
+    ///
     /// # Errors
     /// * if the DWFA throws errors
     pub fn consensus(&self) -> Result<Vec<Consensus>, Box<dyn std::error::Error>> {
@@ -188,11 +190,13 @@ impl<'a> ConsensusDWFA<'a> {
         )
     }
 
-    /// Like [`Self::consensus`], but scores terminals with incremental global edit distances.
+    /// Returns the same ordered results as [`Self::consensus`], using incremental global
+    /// edit distances to score candidate endpoints.
     ///
-    /// This updates a score column for every read on every extension, even if that branch
-    /// is later pruned. Prefer it when finishing wavefronts at many possible endpoints
-    /// dominates the search; otherwise [`Self::consensus`] avoids that per-extension work.
+    /// Try this for long reads with widely varying lengths when native endpoint scoring
+    /// is expensive. A large length gap alone does not guarantee a speedup: this method
+    /// updates scores for every read on every extension, even on branches later pruned.
+    /// If unsure, use [`Self::consensus`] and compare both on representative inputs.
     ///
     /// The DWFA still decides which prefixes to extend and score. The incremental scorer
     /// supports L1 scoring without offsets, a wildcard, early termination, or edit-distance

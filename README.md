@@ -35,6 +35,14 @@ Then the best score is used for each input sequence when calculating the edit di
 This can be further split into a multi-consensus by repeatedly running dual-consensus in a binary-tree like system (e.g., repeatedly split the sequences into groups until they do not want to split further).
 Finally, priority consensus is just multi-consensus on a chain of sequence inputs instead of a single sequence input.
 
+### Choosing a single-consensus scorer
+
+**Use `ConsensusDWFA::consensus()` by default.** Try `consensus_with_global_scores()` for uncapped L1 searches on long reads with a wide range of lengths. Both methods return the same ordered results. The difference is when they pay for scoring: `consensus()` finishes alignments at candidate endpoints, while the incremental method updates scores on every prefix extension, even on branches later discarded.
+
+Use the length spread (longest input minus shortest) as a reason to benchmark, not as a cutoff. Even at a 5,886 bp spread, native scoring was faster on uninterrupted repeats, while incremental scoring won at the same lengths with 0.1% substitutions. Time both calls on representative inputs before switching.
+
+If you use L2, read offsets, a wildcard, early termination, or any edit-distance cap setting (including a floor), call `consensus()` directly. The incremental method falls back to it for those configurations.
+
 ## Limitations
 `waffle_con` has been designed for the specific purpose of PGx consensus in StarPhase using long, accurate HiFi reads.
 The underlying algorithms rely on a basic edit-distance wavefront algorithm, which scales with the total edit distance between two sequences.
