@@ -99,7 +99,8 @@ impl Columns {
 
     fn push_masks(&mut self, patterns: &Patterns, masks: impl Iterator<Item = usize>) {
         let (distances, vectors) = self.state.split_at_mut(self.read_count);
-        let mut words = vectors.chunks_exact_mut(2).zip(masks);
+        let (vectors, _) = vectors.as_chunks_mut::<2>();
+        let mut words = vectors.iter_mut().zip(masks);
         for (distance, read) in distances.iter_mut().zip(&patterns.reads) {
             // Seed each read with D(0, j) - D(0, j - 1) = +1 for global alignment.
             let mut ph = HIGH_BIT;
